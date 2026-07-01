@@ -1,643 +1,2273 @@
 #!/usr/bin/env python3
 """
-nas_migrate_gui.py — Shinigami Eyes
+Shinigami Eyes v2 — Multi-Drive NAS Migration Tool
+Parallel, resumable migration to local folder, Google Drive, or Backblaze B2.
 
-Run with:
-    python3 nas_migrate_gui.py
-
-Requires Python 3 with tkinter.
-  • Homebrew Python already includes it: brew install python
-  • Or install separately: brew install python-tk
+Architecture:
+  • One DriveWorker thread per source drive (configurable concurrency limit)
+  • Shared HashRegistry: all hashes in a Python set (O(1) lockless reads),
+    batched SQLite writes in background — no Redis, no setup, scales to 50M+ files
+  • UploadCoordinator: serialises rclone batches so cloud rate limits aren't hit
+  • Workers don't block on uploads — disk-space back-pressure slows them if needed
+  • Hot-swap: OSError from a removed drive is caught per-file; others keep running
 """
-
-import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox
-import threading
-import os
-import shutil
-import hashlib
-import subprocess
-import glob
-import re
-import tempfile
-import hashlib as _hashlib_state
-from datetime import datetime
+from __future__ import annotations
+import os, sys, shutil, hashlib, threading, tempfile, time
+import json, plistlib, subprocess, queue, sqlite3, re, glob, platform, string, uuid
+import urllib.request, urllib.parse
 from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONFIG
+# PLATFORM
 # ══════════════════════════════════════════════════════════════════════════════
 
-BATCH_LIMIT_GB    = 10
-BATCH_LIMIT_BYTES = BATCH_LIMIT_GB * 1024 * 1024 * 1024
+IS_MAC     = platform.system() == 'Darwin'
+IS_WINDOWS = platform.system() == 'Windows'
+IS_LINUX   = platform.system() == 'Linux'
 
-MIN_FREE_GB       = 15   # pause migration until this much local space is free
+# Menlo is macOS-only — fall back to what Windows/Linux ship with.
+MONO_FONT = 'Menlo' if IS_MAC else ('Consolas' if IS_WINDOWS else 'Monospace')
 
-# Local state directory — always on your machine, never on Google Drive or a NAS.
+RCLONE_INSTALL_HINT = (
+    'brew install rclone' if IS_MAC else
+    'download from rclone.org/downloads, unzip, and add it to PATH' if IS_WINDOWS else
+    'install rclone via your package manager'
+)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+VERSION            = '2.1.0'
+BATCH_LIMIT_GB     = 10
+BATCH_LIMIT_BYTES  = BATCH_LIMIT_GB * 1024 ** 3
+MAX_DISK_USE_PCT   = 0.90           # pause staging when disk >90% full
+MIN_FREE_BYTES     = 5 * 1024 ** 3  # always keep 5 GB free
+DEFAULT_WORKERS    = 3
+CHUNK              = 1_048_576      # 1 MiB read/hash chunk — better for USB 3 / Thunderbolt
+DB_FLUSH_N         = 200            # flush SQLite after this many new hashes
+DB_FLUSH_SECS      = 30
+
 STATE_DIR      = Path.home() / '.shinigami_eyes'
 HASH_DB_FILE   = STATE_DIR / 'hashes.db'
-# Progress files are per-destination: progress_<8-char dest hash>.db
+B2_CONFIG_FILE  = STATE_DIR / 'b2_config.json'
+APP_CONFIG_FILE = STATE_DIR / 'config.json'
 
-DOCUMENT_EXTS = {
-    'pdf', 'doc', 'docx', 'txt', 'rtf', 'odt', 'xls', 'xlsx', 'xlsm',
-    'csv', 'ppt', 'pptx', 'pptm', 'pages', 'numbers', 'keynote',
-    'md', 'epub', 'wpd', 'dotx', 'docm',
+# ── Colours (Matrix theme) ────────────────────────────────────────────────────
+BG      = '#030b03'
+FG      = '#00ff41'
+SURFACE = '#0a160a'
+BORDER  = '#1a4d1a'
+GREEN   = '#00ff41'
+YELLOW  = '#ffe100'
+RED     = '#ff2222'
+MUTED   = '#2d7a2d'
+TEAL    = '#00e5cc'
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JUNK-FILE FILTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+MIN_IMAGE_BYTES = 10 * 1024   # images < 10 KB are icons / thumbnails
+
+SKIP_NAMES = {
+    '.ds_store', 'thumbs.db', 'desktop.ini', '.localized', 'autorun.inf',
+    '._.ds_store', 'icon\r', '.trashes', '.fseventsd', '.spotlight-v100',
+    'hiberfil.sys', 'pagefile.sys', 'swapfile.sys', '.volumeicon.icns',
+    'ehthumbs.db', 'ehthumbs_vista.db', '.com.apple.timemachine.donotpresent',
 }
 
-IMAGE_EXTS = {
-    'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'tif', 'heic', 'heif',
-    'webp', 'svg', 'psd', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'dng',
-    'orf', 'rw2', 'raf', 'x3f', 'erf', 'mos', 'mef', 'rwl', 'srw',
-    'srf', 'sr2', 'nrw', 'fff', 'iiq', '3fr', 'cap', 'ptx', 'pef',
-    'kdc', 'mdc', 'mrw', 'rwz',
+SKIP_EXTENSIONS = {
+    '.ds_store', '.tmp', '.temp', '.part', '.crdownload',
+    '.bup', '.ifo',            # DVD metadata
+    '.pkginfo', '.pbdevelopment',
+    '.pyc', '.pyo', '.pycache',
+    '.class',                  # Java bytecode
+    '.o', '.obj', '.lo', '.la', '.a', '.so', '.dylib',
 }
 
-SKIP_FILENAMES = {
-    '.ds_store', 'thumbs.db', 'desktop.ini', '.localized',
+IMAGE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
+    '.webp', '.heic', '.heif', '.ico', '.icns', '.cur', '.svg',
 }
 
-SKIP_DIRS = {
-    '.spotlight-v100', '.trashes', '.fseventsd', '.temporaryitems',
-    '__macosx', 'recycler', '$recycle.bin', 'system volume information',
-    'caches', 'tmp', 'temp', '.cache', 'windows', 'program files',
-    'program files (x86)',
+SKIP_PATH_PARTS = {
+    '.git', '__pycache__', 'node_modules', '.cargo',
+    '$recycle.bin', 'system volume information', 'recycler',
+    '.spotlight-v100', '.fseventsd', '.trashes', 'lost+found',
+    '.temporaryitems', '.vol', 'frameworks', 'headers',
 }
 
-# ── Colors — Matrix / hacker theme ───────────────────────────────────────────
-BG       = '#030b03'   # near-black, green-tinted
-FG       = '#00ff41'   # matrix green
-ACCENT   = '#00ff41'   # bright green
-SURFACE  = '#0a160a'   # dark green surface
-BORDER   = '#1a4d1a'   # visible green border
-GREEN    = '#00ff41'   # OK — bright matrix green
-YELLOW   = '#ffe100'   # warnings — yellow (readable against black)
-RED      = '#ff2222'   # errors — keep red for contrast
-PURPLE   = '#00ffcc'   # section dividers — teal-green
-TEAL     = '#00e5cc'   # Google Drive lines
-MUTED    = '#2d7a2d'   # dim green for secondary text
+SOFTWARE_DOC_STEMS = {
+    'readme', 'license', 'licence', 'changelog', 'changes', 'history',
+    'install', 'contributing', 'authors', 'copying', 'notice',
+    'patents', 'version', 'release_notes', 'todo', 'hacking',
+}
+
+SOFTWARE_PARENT_DIRS = {
+    'usr', 'lib', 'bin', 'share', 'opt', 'applications', 'library',
+    'frameworks', 'plugins', 'extensions', 'resources',
+}
+
+DOC_EXTENSIONS = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.pages', '.numbers', '.key', '.txt', '.rtf', '.odt', '.ods',
+    '.csv', '.json', '.xml', '.html', '.htm', '.md',
+    '.zip', '.rar', '.7z', '.tar', '.gz', '.dmg', '.iso',
+    '.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mts', '.m2ts',
+    '.mp3', '.aac', '.flac', '.wav', '.aiff', '.m4a',
+    '.psd', '.ai', '.eps', '.indd', '.sketch', '.fig', '.xd',
+    '.prproj', '.aep', '.fcpx', '.ppj', '.drp',
+}
+
+
+def should_skip(filepath: str, size: int) -> tuple[bool, str]:
+    """Return (skip, reason). Cheap string ops only — no Path objects."""
+    name    = os.path.basename(filepath)
+    name_lo = name.lower()
+    dot     = name_lo.rfind('.')
+    ext_lo  = name_lo[dot:] if dot != -1 else ''
+
+    if name_lo in SKIP_NAMES:
+        return True, 'system file'
+    if ext_lo in SKIP_EXTENSIONS:
+        return True, 'junk extension'
+    if ext_lo in IMAGE_EXTENSIONS and size < MIN_IMAGE_BYTES:
+        return True, f'tiny image ({size}B)'
+
+    # Path-parts checks are mostly redundant — os.walk topdown prunes junk dirs
+    # and .app bundles already. Only check the immediate parent dir for software docs.
+    stem_lo   = name_lo[:dot] if dot != -1 else name_lo
+    parent_lo = os.path.basename(os.path.dirname(filepath)).lower()
+    if stem_lo in SOFTWARE_DOC_STEMS:
+        if parent_lo in SOFTWARE_PARENT_DIRS or any(c.isdigit() for c in parent_lo):
+            return True, 'software doc'
+
+    return False, ''
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FILE HELPERS
+# HASH REGISTRY  — thread-safe, SQLite-backed, in-memory lookups
 # ══════════════════════════════════════════════════════════════════════════════
 
-def progress_file_for(output_path: str) -> Path:
-    """Return a local progress-file path keyed to a specific output destination."""
-    key = _hashlib_state.md5(output_path.encode()).hexdigest()[:8]
+class HashRegistry:
+    """
+    Fast dedup store for MD5 hashes.
+
+    All existing hashes are loaded into a Python set at startup, giving O(1)
+    membership tests with no lock required (CPython GIL makes set.__contains__
+    safe to call from multiple threads without explicit locking).
+
+    New hashes are added to the in-memory set immediately (with a write lock),
+    then flushed to SQLite in batches.
+
+    Legacy text-format hashes.db is auto-migrated to SQLite on first run.
+    """
+
+    def __init__(self, db_path: Path):
+        self._db_path   = db_path
+        self._hashes: set[str] = set()
+        self._write_q: list[tuple[str, str]] = []
+        self._lock      = threading.Lock()
+        self._last_flush = time.monotonic()
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def open(self) -> int:
+        """Load existing hashes into memory. Returns count loaded."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._migrate_text_db()
+        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        self._conn.execute('PRAGMA journal_mode=WAL')
+        self._conn.execute('PRAGMA synchronous=NORMAL')
+        self._conn.execute('''CREATE TABLE IF NOT EXISTS file_hashes (
+            hash TEXT NOT NULL,
+            source_path TEXT,
+            added_at TEXT)''')
+        self._conn.execute('CREATE INDEX IF NOT EXISTS idx_hash ON file_hashes(hash)')
+        self._conn.commit()
+        for (h,) in self._conn.execute('SELECT hash FROM file_hashes'):
+            self._hashes.add(h)
+        return len(self._hashes)
+
+    def close(self):
+        self.flush()
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def _migrate_text_db(self):
+        if not self._db_path.exists():
+            return
+        with open(self._db_path, 'rb') as f:
+            if f.read(16) == b'SQLite format 3\x00':
+                return  # already SQLite
+        backup = self._db_path.with_suffix('.bak')
+        self._db_path.rename(backup)
+        conn = sqlite3.connect(str(self._db_path))
+        # Speed pragmas — this is a bulk import, durability doesn't matter
+        conn.execute('PRAGMA journal_mode=OFF')
+        conn.execute('PRAGMA synchronous=OFF')
+        conn.execute('PRAGMA cache_size=-131072')   # 128 MB page cache
+        conn.execute('''CREATE TABLE file_hashes
+                        (hash TEXT NOT NULL, source_path TEXT,
+                         added_at TEXT)''')
+        # NO index yet — bulk insert first, index after (10-100x faster)
+        CHUNK = 50_000
+        buf: list[tuple[str, str]] = []
+        try:
+            with open(backup, 'r', errors='replace') as f:
+                for line in f:
+                    line = line.strip()
+                    if '|' in line:
+                        h, *rest = line.split('|')
+                        buf.append((h.strip(), rest[0].strip() if rest else ''))
+                        if len(buf) >= CHUNK:
+                            conn.executemany(
+                                'INSERT INTO file_hashes(hash,source_path) VALUES(?,?)', buf)
+                            conn.commit()
+                            buf.clear()
+        except Exception:
+            pass
+        if buf:
+            conn.executemany('INSERT INTO file_hashes(hash,source_path) VALUES(?,?)', buf)
+            conn.commit()
+        # Build index once after all rows are in — vastly faster than per-row
+        conn.execute('CREATE INDEX idx_hash ON file_hashes(hash)')
+        conn.commit()
+        conn.close()
+
+    # no lock needed for reads — set.__contains__ is atomic under CPython GIL
+    def contains(self, h: str) -> bool:
+        return h in self._hashes
+
+    def add(self, h: str, source_path: str):
+        with self._lock:
+            self._hashes.add(h)
+            self._write_q.append((h, source_path))
+            should = (len(self._write_q) >= DB_FLUSH_N or
+                      time.monotonic() - self._last_flush > DB_FLUSH_SECS)
+        if should:
+            self.flush()
+
+    def flush(self):
+        with self._lock:
+            if not self._write_q or not self._conn:
+                return
+            batch = self._write_q[:]
+            self._write_q.clear()
+            self._last_flush = time.monotonic()
+        try:
+            self._conn.executemany(
+                'INSERT INTO file_hashes(hash,source_path) VALUES(?,?)', batch)
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def checkpoint(self):
+        """Fold the WAL sidecar file back into the main .db file. Needed
+        before copying hashes.db out-of-band (e.g. to sync it to another
+        machine via B2) — under WAL mode, recent commits can sit in a
+        separate hashes.db-wal file that a plain file copy would miss."""
+        if not self._conn:
+            return
+        try:
+            self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DRIVE INFO
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DriveInfo:
+    path:         str
+    label:        str = ''
+    total_bytes:  int = 0
+    used_bytes:   int = 0
+    fs_type:      str = ''
+    device:       str = ''
+    serial:       str = ''
+    manufacturer: str = ''
+    bus:          str = ''
+
+    @property
+    def label_or_name(self) -> str:
+        return self.label or os.path.basename(self.path) or self.path
+
+    @property
+    def size_str(self) -> str:
+        return _fmt_bytes(self.total_bytes) if self.total_bytes else '?'
+
+    @property
+    def used_str(self) -> str:
+        return _fmt_bytes(self.used_bytes) if self.used_bytes else '?'
+
+    @property
+    def detail_str(self) -> str:
+        parts = []
+        if self.bus:        parts.append(self.bus)
+        if self.manufacturer: parts.append(self.manufacturer)
+        if self.serial:     parts.append(f'S/N: {self.serial}')
+        if self.fs_type:    parts.append(self.fs_type)
+        cap = f'{self.used_str} used / {self.size_str}' if self.total_bytes else ''
+        if cap: parts.append(cap)
+        return '  |  '.join(parts) if parts else self.path
+
+
+def get_drive_info(volume_path: str) -> DriveInfo:
+    if IS_WINDOWS:
+        return _get_drive_info_windows(volume_path)
+
+    info = DriveInfo(path=volume_path, label=os.path.basename(volume_path))
+    try:
+        r = subprocess.run(['diskutil', 'info', '-plist', volume_path],
+                           capture_output=True, timeout=10)
+        if r.returncode == 0:
+            d = plistlib.loads(r.stdout)
+            info.total_bytes = d.get('TotalSize', 0)
+            info.fs_type     = d.get('FilesystemName', d.get('Content', ''))
+            info.device      = d.get('DeviceIdentifier', '')
+            info.label       = d.get('VolumeName', info.label) or info.label
+            free = (d.get('FreeSpace') or d.get('VolumeFreeSpace') or
+                    d.get('APFSContainerFree') or 0)
+            if free and info.total_bytes:
+                info.used_bytes = info.total_bytes - free
+    except Exception:
+        pass
+
+    if info.device:
+        m = re.match(r'(disk\d+)', info.device)
+        parent = m.group(1) if m else info.device
+        try:
+            r2 = subprocess.run(
+                ['system_profiler', 'SPUSBDataType', 'SPThunderboltDataType', '-json'],
+                capture_output=True, timeout=15)
+            if r2.returncode == 0:
+                _extract_hw_info(r2.stdout, parent, info)
+        except Exception:
+            pass
+    return info
+
+
+def _get_drive_info_windows(volume_path: str) -> DriveInfo:
+    """Windows equivalent of get_drive_info(). Uses shutil.disk_usage() for
+    capacity (no WMI/pywin32 dependency needed there) and a single PowerShell
+    round-trip (Get-Volume / Get-Partition / Get-PhysicalDisk / Get-Disk,
+    all built into Windows) for filesystem, label, manufacturer, serial and
+    bus type — no external pip packages required, matching the no-deps goal."""
+    drive_letter = volume_path.rstrip('\\')[:1].upper() or 'C'
+    info = DriveInfo(path=volume_path, label=f'{drive_letter}:')
+
+    try:
+        du = shutil.disk_usage(volume_path)
+        info.total_bytes = du.total
+        info.used_bytes  = du.used
+    except Exception:
+        pass
+
+    ps_script = (
+        f"$dl = '{drive_letter}'\n"
+        "$vol = Get-Volume -DriveLetter $dl -ErrorAction SilentlyContinue\n"
+        "$part = Get-Partition -DriveLetter $dl -ErrorAction SilentlyContinue\n"
+        "$result = [ordered]@{\n"
+        "    FileSystem = [string]$vol.FileSystemType\n"
+        "    Label = $vol.FileSystemLabel\n"
+        "}\n"
+        "if ($part) {\n"
+        "    $phys = Get-PhysicalDisk -DeviceNumber $part.DiskNumber -ErrorAction SilentlyContinue\n"
+        "    $disk = Get-Disk -Number $part.DiskNumber -ErrorAction SilentlyContinue\n"
+        "    $result.Model = $phys.FriendlyName\n"
+        "    $result.Manufacturer = $phys.Manufacturer\n"
+        "    $result.SerialNumber = $disk.SerialNumber\n"
+        "    $result.BusType = [string]$phys.BusType\n"
+        "}\n"
+        "$result | ConvertTo-Json -Compress"
+    )
+    try:
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_script],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode == 0 and r.stdout.strip():
+            d = json.loads(r.stdout.strip())
+            info.fs_type      = d.get('FileSystem') or info.fs_type
+            info.label        = d.get('Label') or info.label
+            info.device       = f'{drive_letter}:'
+            serial            = d.get('SerialNumber')
+            info.serial       = str(serial).strip() if serial else ''
+            info.manufacturer = (d.get('Manufacturer') or d.get('Model') or '').strip()
+            info.bus          = (d.get('BusType') or '').strip()
+    except Exception:
+        pass
+    return info
+
+
+def _extract_hw_info(profiler_json: bytes, parent_disk: str, info: DriveInfo):
+    try:
+        data = json.loads(profiler_json)
+    except Exception:
+        return
+    for key, items in data.items():
+        bus = ('USB' if 'USB' in key else
+               'Thunderbolt' if 'Thunderbolt' in key else key)
+        _walk_sp(items, parent_disk, info, bus)
+
+
+def _walk_sp(nodes, parent_disk: str, info: DriveInfo, bus: str):
+    if not isinstance(nodes, list):
+        return
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if parent_disk in node.get('bsd_name', ''):
+            info.serial       = node.get('serial_num', info.serial)
+            info.manufacturer = node.get('manufacturer', info.manufacturer)
+            info.bus          = bus
+            return
+        for media in node.get('Media', []):
+            if not isinstance(media, dict):
+                continue
+            for v in (media.get('volumes', []) or []):
+                if isinstance(v, dict) and parent_disk in v.get('bsd_name', ''):
+                    info.serial       = node.get('serial_num', info.serial)
+                    info.manufacturer = node.get('manufacturer', info.manufacturer)
+                    info.bus          = bus
+                    return
+        _walk_sp(node.get('_items', []), parent_disk, info, bus)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fmt_bytes(n: int) -> str:
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if n < 1024:
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} PB'
+
+
+def _free_bytes() -> int:
+    # shutil.disk_usage() is cross-platform (os.statvfs() doesn't exist on
+    # Windows — that silently returned 0 free bytes there, which would have
+    # permanently blocked _can_stage() from ever staging a cloud upload).
+    try:
+        return shutil.disk_usage(Path.home()).free
+    except Exception:
+        return 0
+
+
+def _can_stage(size: int) -> bool:
+    free = _free_bytes()
+    return free > max(MIN_FREE_BYTES, size + 512 * 1024 * 1024)
+
+
+def send_ntfy(topic: str, message: str, title: str = 'Shinigami Eyes'):
+    """POST a push notification via ntfy.sh using urllib (stdlib) instead of
+    shelling out to curl — curl.exe isn't guaranteed to be present on every
+    Windows install, whereas urllib always is. Title is percent-encoded per
+    ntfy's own convention since HTTP headers can't carry raw UTF-8/emoji."""
+    if not topic:
+        return
+    try:
+        req = urllib.request.Request(
+            f'https://ntfy.sh/{topic.strip()}',
+            data=message.encode('utf-8'),
+            headers={'Title': urllib.parse.quote(title)},
+            method='POST',
+        )
+        urllib.request.urlopen(req, timeout=15)
+    except Exception:
+        pass
+
+
+def progress_file_for(output_path: str, source_path: str) -> Path:
+    key = hashlib.md5(f'{source_path}|{output_path}'.encode()).hexdigest()[:12]
     return STATE_DIR / f'progress_{key}.db'
 
 
-
-def free_bytes() -> int:
-    """Return available bytes on the volume where user data lives."""
-    import shutil
-    return shutil.disk_usage(Path.home()).free
-
-
-def wait_for_space(min_gb: float, status_fn=None):
-    """
-    Block until at least min_gb of free space is available,
-    reporting progress every 5 seconds via status_fn if provided.
-    """
-    import time
-    min_bytes = min_gb * 1024 ** 3
-    while free_bytes() < min_bytes:
-        free = free_bytes() / 1024 ** 3
-        if status_fn:
-            status_fn(
-                f'> waiting for GDrive to upload...  '
-                f'{free:.1f} GB free, need {min_gb:.0f} GB'
-            )
-        time.sleep(5)
-
-
-def find_google_drive():
-    home = Path.home()
-    matches = glob.glob(str(home / 'Library/CloudStorage/GoogleDrive-*/My Drive'))
-    if matches:
-        return matches[0]
-    for p in [home / 'Google Drive/My Drive', home / 'Google Drive']:
-        if p.exists():
-            return str(p)
-    return None
-
-
-def find_rclone():
-    """Return (rclone_binary, [remote_names]) or (None, []) if unavailable."""
-    import shutil as _sh
-    candidates = [
-        _sh.which('rclone'),
-        '/opt/homebrew/bin/rclone',
-        '/usr/local/bin/rclone',
-    ]
-    rclone = next((p for p in candidates if p and os.path.isfile(p)), None)
-    if not rclone:
-        return None, []
-    try:
-        out = subprocess.run(
-            [rclone, 'listremotes'],
-            capture_output=True, text=True, timeout=10,
-        )
-        remotes = [r.rstrip(':') for r in out.stdout.strip().splitlines() if r.strip()]
-        return rclone, remotes
-    except Exception:
-        return rclone, []
-
-
-def get_md5(filepath):
-    h = hashlib.md5()
-    try:
-        with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(131072), b''):
-                h.update(chunk)
-        return h.hexdigest()
-    except OSError:
-        return None
-
-
-def copy_and_hash(src_path: str, dest_dir: str):
-    """
-    Stream src_path into a temp file inside dest_dir while computing MD5 —
-    single read pass instead of hash-then-copy.
-
-    Returns (md5_hex, tmp_filepath, bytes_written).
-    Caller must either shutil.move(tmp, final_dest) or os.unlink(tmp).
-    Cleans up tmp and re-raises on any error.
-    """
-    h = hashlib.md5()
-    tmp = os.path.join(dest_dir,
-                       f'.shinigami_tmp_{os.getpid()}_{os.urandom(4).hex()}')
+def copy_and_hash(src: str, dest_dir: str) -> tuple[str, str, int]:
+    """Single-pass: copy + MD5 simultaneously. Returns (hash, tmp_path, bytes).
+    Raises ValueError if bytes written don't match bytes read (write integrity check)."""
+    h   = hashlib.md5()
+    tmp = os.path.join(dest_dir, f'.se_{os.getpid()}_{os.urandom(4).hex()}')
     written = 0
     try:
-        with open(src_path, 'rb') as fsrc, open(tmp, 'wb') as fdst:
-            for chunk in iter(lambda: fsrc.read(131072), b''):
+        with open(src, 'rb') as fsrc, open(tmp, 'wb') as fdst:
+            for chunk in iter(lambda: fsrc.read(CHUNK), b''):
                 h.update(chunk)
                 fdst.write(chunk)
                 written += len(chunk)
-        shutil.copystat(src_path, tmp)
+        # Integrity check: staged file must be exactly the right size
+        staged = os.path.getsize(tmp)
+        if staged != written:
+            raise ValueError(f'write integrity fail: read {written}B, staged {staged}B')
         return h.hexdigest(), tmp, written
     except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
+        try: os.unlink(tmp)
+        except Exception: pass
         raise
 
 
-def get_creation_date(filepath):
+def build_dest_path(dest_dir: str, filename: str) -> str:
+    """Return a unique destination path, adding _1, _2 … suffix if the name is taken."""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(dest_dir, filename)
+    counter   = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(dest_dir, f'{base}_{counter}{ext}')
+        counter  += 1
+    return candidate
+
+
+_WINDOWS_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_for_windows(name: str) -> str:
+    """Strip characters that are illegal in Windows filenames/paths. No-op on
+    other platforms. Source drives (HFS+/APFS/exFAT) can legally contain
+    filenames or volume labels with characters Windows rejects (e.g. ':' was
+    valid in classic Mac/HFS filenames) — without this, shutil.move() to a
+    Windows destination would raise OSError mid-migration."""
+    if not IS_WINDOWS:
+        return name
+    cleaned = _WINDOWS_INVALID_CHARS.sub('_', name)
+    cleaned = cleaned.rstrip(' .')   # trailing dot/space is also invalid on Windows
+    return cleaned or '_'
+
+
+def list_windows_drives() -> list[str]:
+    """Return mounted drive letters as ['C:\\\\', 'D:\\\\', ...] (Windows only)."""
+    if not IS_WINDOWS:
+        return []
+    import ctypes
+    drives = []
+    bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+    for i, letter in enumerate(string.ascii_uppercase):
+        if bitmask & (1 << i):
+            drives.append(f'{letter}:\\')
+    return drives
+
+
+def find_rclone() -> str:
+    if IS_WINDOWS:
+        candidates = [
+            shutil.which('rclone'),   # resolves rclone.exe via PATH
+            # winget's "Rclone.Rclone" package links its shim here — this is
+            # added to the User PATH at install time, but a process already
+            # running when that happens won't see it without a PATH refresh
+            # (see _refresh_windows_path_env()), so check it explicitly too.
+            os.path.join(os.environ.get('LOCALAPPDATA', ''),
+                         'Microsoft', 'WinGet', 'Links', 'rclone.exe'),
+            r'C:\rclone\rclone.exe',
+            os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'),
+                         'rclone', 'rclone.exe'),
+            os.path.join(os.environ.get('LOCALAPPDATA', ''),
+                         'rclone', 'rclone.exe'),
+            'rclone',
+        ]
+    else:
+        candidates = ['/opt/homebrew/bin/rclone', '/usr/local/bin/rclone',
+                      shutil.which('rclone'), 'rclone']
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            if subprocess.run([p, 'version'], capture_output=True, timeout=5).returncode == 0:
+                return p
+        except Exception:
+            pass
+    return ''
+
+
+def _refresh_windows_path_env():
+    """Installers like winget update PATH in the registry, but a process
+    that's already running inherited its PATH once at startup and won't
+    pick up the change on its own. Re-read User + System PATH from the
+    registry and merge them into os.environ so shutil.which()/subprocess
+    can find a just-installed binary without restarting the app."""
+    if not IS_WINDOWS:
+        return
     try:
-        out = subprocess.run(
-            ['mdls', '-raw', '-name', 'kMDItemContentCreationDate', filepath],
-            capture_output=True, text=True, timeout=5
-        ).stdout
-        m = re.search(r'(\d{4})-(\d{2})-(\d{2})', out)
-        if m:
-            return f"{m.group(1)}-{m.group(3)}-{m.group(2)}"   # YYYY-DD-MM
-    except Exception:
-        pass
-    try:
-        out = subprocess.run(
-            ['stat', '-f', '%SB', '-t', '%Y-%m-%d', filepath],
-            capture_output=True, text=True, timeout=5
-        ).stdout.strip()
-        if re.match(r'\d{4}-\d{2}-\d{2}', out):
-            y, mo, d = out[:4], out[5:7], out[8:10]
-            return f"{y}-{d}-{mo}"
-    except Exception:
-        pass
-    return datetime.now().strftime('%Y-%d-%m')
-
-
-def build_dest_path(dest_dir, filename, source_file):
-    p = Path(filename)
-    base, ext = p.stem, p.suffix
-
-    dest = Path(dest_dir) / filename
-    if not dest.exists():
-        return str(dest)
-
-    cdate = get_creation_date(source_file)
-    dest = Path(dest_dir) / f"{base}-{cdate}{ext}"
-    if not dest.exists():
-        return str(dest)
-
-    n = 1
-    while True:
-        dest = Path(dest_dir) / f"{base}-DUPLICATE-{cdate}-{n}{ext}"
-        if not dest.exists():
-            return str(dest)
-        n += 1
-
-
-def should_skip(filepath, source_root):
-    p = Path(filepath)
-    name = p.name
-    if name.startswith('.') or name.lower() in SKIP_FILENAMES:
-        return True
-    if name.startswith('~$') or name.endswith(('.tmp', '.temp', '.crdownload', '.part', '.swp')):
-        return True
-    parent = p.parent
-    while parent != Path(source_root) and parent != parent.parent:
-        dn = parent.name.lower()
-        if dn.startswith('.') or dn in SKIP_DIRS:
-            return True
-        parent = parent.parent
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GUI
-# ══════════════════════════════════════════════════════════════════════════════
-
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title('Shinigami Eyes')
-        self.configure(bg=BG)
-        self.resizable(True, True)
-        self.minsize(660, 700)
-
-        self._running         = False
-        self._thread          = None
-        self._gd_path         = find_google_drive()
-        self._rclone_path, self._rclone_remotes = find_rclone()
-
-        self._build_ui()
-        self.after(200, self._cleanup_orphans)
-
-    # ── Startup orphan cleanup ────────────────────────────────────────────────
-
-    def _cleanup_orphans(self):
-        """Remove any nas_migrate_stage_* temp dirs left behind by crashed runs."""
-        pattern = os.path.join(tempfile.gettempdir(), 'nas_migrate_stage_*')
-        orphans = glob.glob(pattern)
-        if not orphans:
-            return
-        total_bytes = 0
-        removed = 0
-        for d in orphans:
+        import winreg
+        found = []
+        for hive, subkey in [
+            (winreg.HKEY_CURRENT_USER, r'Environment'),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r'SYSTEM\CurrentControlSet\Control\Session Manager\Environment'),
+        ]:
             try:
-                for root, _, files in os.walk(d):
-                    for f in files:
-                        try:
-                            total_bytes += os.path.getsize(os.path.join(root, f))
-                        except Exception:
-                            pass
-                shutil.rmtree(d, ignore_errors=True)
-                removed += 1
+                with winreg.OpenKey(hive, subkey) as key:
+                    val, _ = winreg.QueryValueEx(key, 'Path')
+                    if val:
+                        found.append(val)
             except Exception:
                 pass
-        if removed:
-            gb = total_bytes / (1024 ** 3)
-            self._log(
-                f'  STARTUP  Removed {removed} orphaned staging folder(s)  '
-                f'({gb:.2f} GB recovered from temp)',
-                'skip',
+        if found:
+            current = os.environ.get('PATH', '')
+            os.environ['PATH'] = ';'.join(found) + (';' + current if current else '')
+    except Exception:
+        pass
+
+
+def install_rclone_winget(log_fn=None) -> bool:
+    """Install rclone via winget (Windows Package Manager — built into
+    Windows 10 1809+ / 11 as part of App Installer). Returns True if rclone
+    can be located afterward."""
+    log = log_fn or (lambda msg, tag='': None)
+    if not IS_WINDOWS:
+        return False
+    winget = shutil.which('winget')
+    if not winget:
+        log('  ERR  winget not found — install "App Installer" from the '
+            'Microsoft Store, or install rclone manually from rclone.org/downloads.', 'err')
+        return False
+    try:
+        log('  Installing rclone via winget (Rclone.Rclone)…', 'info')
+        proc = subprocess.Popen(
+            [winget, 'install', '--id', 'Rclone.Rclone', '-e',
+             '--silent', '--accept-package-agreements', '--accept-source-agreements'],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(f'  winget: {line}', 'info')
+        proc.wait(timeout=300)
+        if proc.returncode != 0:
+            # Non-zero can also mean "already installed" or similar —
+            # find_rclone() below is the real source of truth either way.
+            log(f'  winget exited with code {proc.returncode}', 'warn')
+    except subprocess.TimeoutExpired:
+        log('  ERR  winget install timed out after 5 minutes', 'err')
+        return False
+    except Exception as e:
+        log(f'  ERR  winget install failed: {e}', 'err')
+        return False
+
+    _refresh_windows_path_env()
+    found = find_rclone()
+    if found:
+        log(f'  ✓ rclone found at {found}', 'ok')
+    else:
+        log('  ✗ rclone still not found after install — you may need to '
+            'restart the app for PATH changes to take effect', 'err')
+    return bool(found)
+
+
+def find_gdrive() -> str:
+    if IS_WINDOWS:
+        # Google Drive for Desktop on Windows mounts "My Drive" either as its
+        # own drive letter (streaming mode, e.g. G:\My Drive) or under the
+        # user's profile (mirror mode). Only probe mounted letters so we
+        # don't stall on empty removable-drive slots.
+        for drive in list_windows_drives():
+            candidate = Path(drive) / 'My Drive'
+            if candidate.is_dir():
+                return str(candidate)
+        home = Path.home()
+        for p in [home / 'Google Drive' / 'My Drive', home / 'My Drive',
+                  home / 'Google Drive']:
+            if p.exists():
+                return str(p)
+        return ''
+
+    for base in [Path.home() / 'Library' / 'CloudStorage', Path('/Volumes')]:
+        if not base.exists():
+            continue
+        for p in base.iterdir():
+            if 'googledrive' in p.name.lower() or 'google drive' in p.name.lower():
+                return str(p)
+    return ''
+
+
+def load_b2_config() -> dict:
+    try:
+        with open(B2_CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_b2_config(key_id, app_key, bucket, subfolder):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(B2_CONFIG_FILE, 'w') as f:
+        json.dump({'key_id': key_id, 'app_key': app_key,
+                   'bucket': bucket, 'subfolder': subfolder}, f, indent=2)
+
+
+def load_app_config() -> dict:
+    try:
+        with open(APP_CONFIG_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_app_config(**kwargs):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = load_app_config()
+    cfg.update(kwargs)
+    with open(APP_CONFIG_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-MACHINE HASH SYNC (B2)  — run Shinigami Eyes on two machines at once,
+# sharing one dedup registry through the same B2 bucket they already upload to
+# ══════════════════════════════════════════════════════════════════════════════
+
+HASH_SYNC_PREFIX = '.shinigami_eyes'   # key prefix in the bucket, separate
+                                       # from the Documents/Photos being migrated
+
+def get_machine_id() -> str:
+    """Stable short ID for this machine. Namespaces this machine's pushed
+    hash DB (hashes_<id>.db) so multiple machines sharing one B2 bucket don't
+    stomp on each other's file. Persisted in config.json."""
+    cfg = load_app_config()
+    if 'machine_id' not in cfg:
+        cfg['machine_id'] = uuid.uuid4().hex[:8]
+        save_app_config(machine_id=cfg['machine_id'])
+    return cfg['machine_id']
+
+
+def pull_remote_hashes(registry: 'HashRegistry', rclone_path: str,
+                       b2_key_id: str, b2_app_key: str, b2_bucket: str,
+                       machine_id: str, log_fn=None) -> int:
+    """Download every *other* machine's hashes_<id>.db from the shared B2
+    bucket and merge those hashes into `registry` — both the in-memory set
+    (immediate effect) and this machine's own local SQLite (so the merge
+    survives future offline runs too). Returns the count of new hashes merged.
+
+    This only needs to run once per session start, not continuously: even if
+    two machines both stage the same file before either has pulled the
+    other's hashes, rclone's --checksum flag means the second upload is
+    recognized as already present in B2 and skipped — cross-machine dedup at
+    the network layer is the safety net under this in-memory one."""
+    log = log_fn or (lambda msg, tag='': None)
+    if not rclone_path:
+        return 0
+    remote_dir = f':b2:{b2_bucket}/{HASH_SYNC_PREFIX}/'
+    local_tmp  = STATE_DIR / '_remote_hashes'
+    local_tmp.mkdir(parents=True, exist_ok=True)
+    b2_flags = [f'--b2-account={b2_key_id}', f'--b2-key={b2_app_key}']
+
+    # List what's actually there first. Without this, a failure (wrong
+    # bucket, bad credentials, nothing pushed yet) looks identical to "no
+    # new hashes to merge" in the log — this makes the difference visible.
+    try:
+        ls = subprocess.run([rclone_path, 'lsf', remote_dir] + b2_flags,
+                            capture_output=True, text=True, timeout=60)
+        if ls.returncode != 0:
+            log(f'  WARN  could not list {remote_dir}: {ls.stderr.strip()[:300]}', 'warn')
+            return 0
+        remote_files = [l.strip() for l in ls.stdout.splitlines() if l.strip()]
+        others = [f for f in remote_files if f != f'hashes_{machine_id}.db']
+        log(f'  Found {len(remote_files)} hash DB(s) in B2 — '
+            f'{len(others)} from other machine(s)', 'info')
+        if not others:
+            return 0
+    except Exception as e:
+        log(f'  WARN  could not list remote hash DBs: {e}', 'warn')
+        return 0
+
+    try:
+        cp = subprocess.run(
+            [rclone_path, 'copy', remote_dir, str(local_tmp)] + b2_flags + [
+             # Order matters: exclude-own must come before include-pattern,
+             # since rclone filter rules are first-match-wins.
+             '--exclude', f'hashes_{machine_id}.db',
+             '--include', 'hashes_*.db'],
+            capture_output=True, text=True, timeout=120)
+        if cp.returncode != 0:
+            log(f'  WARN  rclone copy failed pulling remote hashes: '
+                f'{cp.stderr.strip()[:300]}', 'warn')
+            return 0
+    except Exception as e:
+        log(f'  WARN  could not pull remote hash DBs: {e}', 'warn')
+        return 0
+
+    merged = 0
+    found_files = list(local_tmp.glob('hashes_*.db'))
+    if not found_files and others:
+        log('  WARN  rclone reported success but no hash DB files landed '
+            'locally — check bucket/subfolder match between machines', 'warn')
+    for db_file in found_files:
+        try:
+            conn = sqlite3.connect(str(db_file))
+            for (h,) in conn.execute('SELECT hash FROM file_hashes'):
+                if not registry.contains(h):
+                    registry.add(h, f'remote:{db_file.stem}')
+                    merged += 1
+            conn.close()
+        except Exception as e:
+            log(f'  WARN  could not read {db_file.name}: {e}', 'warn')
+        finally:
+            try: db_file.unlink()
+            except Exception: pass
+    return merged
+
+
+def push_local_hashes(rclone_path: str, b2_key_id: str, b2_app_key: str,
+                      b2_bucket: str, machine_id: str, log_fn=None):
+    """Push this machine's hashes.db up to the shared B2 bucket so other
+    machines can pick it up on their next run. Intended to be called from a
+    background thread — network I/O, never on the UI thread.
+
+    Uses `rclone copyto`, NOT `rclone copy` — copy always treats the
+    destination as a directory and preserves the source's basename, so a
+    destination like ".../hashes_<id>.db" would silently become a *folder*
+    named "hashes_<id>.db" containing a file called "hashes.db" inside it,
+    rather than a flat file at that exact path. copyto does an exact
+    source-to-dest file mapping (rename included), which is what a
+    machine-specific filename actually needs."""
+    log = log_fn or (lambda msg, tag='': None)
+    if not rclone_path:
+        log('  WARN  cannot push hash DB — rclone not found', 'warn')
+        return
+    if not HASH_DB_FILE.exists():
+        log('  WARN  cannot push hash DB — no local hashes.db yet', 'warn')
+        return
+    dest = f':b2:{b2_bucket}/{HASH_SYNC_PREFIX}/hashes_{machine_id}.db'
+    try:
+        r = subprocess.run(
+            [rclone_path, 'copyto', str(HASH_DB_FILE), dest,
+             f'--b2-account={b2_key_id}', f'--b2-key={b2_app_key}'],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            log(f'  WARN  could not push hash DB to B2: {r.stderr.strip()[:300]}', 'warn')
+        else:
+            kb = HASH_DB_FILE.stat().st_size / 1024
+            log(f'  ↑ Hash DB pushed to B2 ({kb:.0f} KB)', 'info')
+    except Exception as e:
+        log(f'  WARN  could not push hash DB to B2: {e}', 'warn')
+
+
+def cleanup_orphan_stages():
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), 'se_stage_*')):
+        try:
+            shutil.rmtree(d)
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UPLOAD COORDINATOR  — serialises rclone batches from all DriveWorkers
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class UploadJob:
+    stage_dir:     str
+    pending:       list         # [(src_path, md5), ...]
+    progress_path: Path
+    drive_label:   str
+    batch_num:     int
+    done_event:    threading.Event = field(default_factory=threading.Event)
+    success:       bool = False
+    # destination (filled at enqueue time)
+    use_b2:        bool = False
+    b2_key_id:     str  = ''
+    b2_app_key:    str  = ''
+    b2_bucket:     str  = ''
+    use_rclone:    bool = False
+    rclone_path:   str  = ''
+    rclone_remote: str  = ''
+    gd_subfolder:  str  = ''
+
+
+class UploadCoordinator:
+    """
+    One rclone subprocess at a time.
+    Workers enqueue UploadJobs and get back a threading.Event to optionally wait on.
+    """
+
+    def __init__(self, log_fn: Callable, registry: HashRegistry):
+        self._q      = queue.Queue()
+        self._log    = log_fn
+        self._reg    = registry
+        self._thread = threading.Thread(target=self._loop, daemon=True, name='uploader')
+        self._proc: Optional[subprocess.Popen] = None   # current rclone process
+        self._proc_lock = threading.Lock()
+
+    def start(self): self._thread.start()
+
+    def stop(self):
+        """Kill any in-flight rclone process, then drain the coordinator thread."""
+        with self._proc_lock:
+            if self._proc and self._proc.poll() is None:
+                self._log('  [uploader] Killing in-flight rclone on abort…', 'warn')
+                self._proc.kill()
+        self._q.put(None)
+        self._thread.join(timeout=10)
+
+    def enqueue(self, job: UploadJob) -> threading.Event:
+        """Non-blocking. Returns an Event set when the job finishes."""
+        self._q.put(job)
+        return job.done_event
+
+    def _loop(self):
+        while True:
+            job = self._q.get()
+            if job is None:
+                break
+            try:
+                self._run(job)
+            except Exception as e:
+                self._log(f'  [uploader] FATAL: {e}', 'err')
+                job.done_event.set()
+
+    def _run(self, job: UploadJob):
+        if not job.use_b2 and not job.use_rclone:
+            # Local mode — files already in place, just confirm
+            self._confirm(job)
+            return
+        if job.use_b2:
+            dest = f':b2:{job.b2_bucket}/{job.gd_subfolder}'
+            extra = [f'--b2-account={job.b2_key_id}', f'--b2-key={job.b2_app_key}',
+                     '--b2-chunk-size=96M']
+        else:
+            dest  = f'{job.rclone_remote}:{job.gd_subfolder}'
+            extra = ['--drive-chunk-size=128M']
+
+        self._log(f'\n  ── [{job.drive_label}] Batch #{job.batch_num}'
+                  f' ({len(job.pending)} files) → {dest}', 'gd')
+        cmd = [
+            job.rclone_path, 'copy', job.stage_dir, dest,
+            '--no-traverse', '--transfers=8', '--checkers=16',
+            '--buffer-size=64M', '-v', '--stats=10s', '--stats-one-line',
+            '--checksum',                   # skip files already in B2 with same MD5
+            '--retries=5',                  # retry full transfer on error
+            '--low-level-retries=10',       # retry individual HTTP ops
+        ] + extra
+
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1)
+                with self._proc_lock:
+                    self._proc = proc
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line: self._log(f'  →  {line}', 'gd')
+                proc.wait()
+            except Exception as e:
+                self._log(f'  ERR  rclone crashed: {e}', 'err')
+                job.done_event.set()
+                return
+
+            if proc.returncode == 0:
+                shutil.rmtree(job.stage_dir, ignore_errors=True)
+                self._confirm(job)
+                return
+
+            self._log(f'  ERR  [{job.drive_label}] rclone exit {proc.returncode}'
+                      f' (attempt {attempt}/{max_attempts})', 'err')
+            if attempt < max_attempts:
+                time.sleep(30 * attempt)   # back off 30s, 60s before retrying
+
+        self._log(f'  ERR  [{job.drive_label}] batch #{job.batch_num} failed after'
+                  f' {max_attempts} attempts — files safe in {job.stage_dir}', 'err')
+        job.done_event.set()
+
+    def _confirm(self, job: UploadJob):
+        try:
+            with open(job.progress_path, 'a') as pf:
+                for src_path, h in job.pending:
+                    self._reg.add(h, src_path)
+                    pf.write(src_path + '\n')
+            job.success = True
+            self._log(f'  ✓  [{job.drive_label}] batch #{job.batch_num} confirmed'
+                      f' ({len(job.pending)} files)', 'ok')
+            if job.use_b2:
+                # Push the updated hash DB to B2 so another machine running
+                # concurrently picks up these hashes on its next run. Async —
+                # never blocks the upload pipeline.
+                threading.Thread(target=self._push_hashes_async, args=(job,),
+                                 daemon=True).start()
+        except Exception as e:
+            self._log(f'  ERR  confirm: {e}', 'err')
+        finally:
+            job.done_event.set()
+
+    def _push_hashes_async(self, job: UploadJob):
+        self._reg.flush()
+        self._reg.checkpoint()
+        push_local_hashes(job.rclone_path, job.b2_key_id, job.b2_app_key,
+                          job.b2_bucket, get_machine_id(), log_fn=self._log)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DRIVE WORKER  — one thread per source drive
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DriveStats:
+    label:           str
+    copied:          int = 0
+    skipped_dupe:    int = 0
+    skipped_sys:     int = 0
+    skipped_resume:  int = 0
+    errors:          int = 0
+    batches:         int = 0
+    bytes_copied:    int = 0
+    status:          str = 'queued'   # queued | running | uploading | done | error
+    fatal:           str = ''
+
+
+class DriveWorker:
+    def __init__(
+        self, *,
+        source_path: str, output_path: str, info: DriveInfo,
+        registry: HashRegistry, coordinator: UploadCoordinator,
+        use_gdrive=False, use_rclone=False, use_b2=False,
+        rclone_path='', rclone_remote='', gd_subfolder='',
+        b2_key_id='', b2_app_key='', b2_bucket='',
+        log_fn=print, on_done=None, on_progress=None,
+        ntfy_topic='', resume=False,
+        running_ref: Callable = lambda: True,
+        batch_limit: int = BATCH_LIMIT_BYTES,
+    ):
+        self.src          = source_path
+        self.out          = output_path
+        self.info         = info
+        self.registry     = registry
+        self.coordinator  = coordinator
+        self.use_gdrive   = use_gdrive
+        self.use_rclone   = use_rclone
+        self.use_b2       = use_b2
+        self.rclone_path  = rclone_path
+        self.rclone_remote = rclone_remote
+        self.gd_subfolder = gd_subfolder
+        self.b2_key_id    = b2_key_id
+        self.b2_app_key   = b2_app_key
+        self.b2_bucket    = b2_bucket
+        self._log         = log_fn
+        self._on_done        = on_done or (lambda s: None)
+        self._on_progress_cb = on_progress or (lambda s: None)
+        self.ntfy_topic   = ntfy_topic
+        self.resume       = resume
+        self._running     = running_ref
+        self.batch_limit  = batch_limit
+        self.stats        = DriveStats(label=info.label_or_name)
+        self._active      = False   # True while _run() is executing
+        self._last_progress_t = 0.0  # per-drive throttle timestamp
+
+    def is_alive(self): return self._active
+
+    def _on_progress(self, s: DriveStats):
+        """Throttle UI callbacks to ~1 Hz per drive."""
+        now = time.monotonic()
+        if now - self._last_progress_t < 1.0:
+            return
+        self._last_progress_t = now
+        self._on_progress_cb(s)
+
+    def _run(self):
+        self._active      = True
+        self.stats.status = 'running'
+        try:
+            self._migrate()
+        except Exception as e:
+            self.stats.fatal  = str(e)
+            self.stats.status = 'error'
+            self._log(f'  [{self.info.label_or_name}] FATAL: {e}', 'err')
+        finally:
+            self._active = False
+            if not self.stats.fatal:
+                self.stats.status = 'done' if self._running() else 'aborted'
+            self._on_done(self.stats)
+
+    def _migrate(self):
+        use_cloud     = self.use_rclone or self.use_b2
+        label         = self.info.label_or_name
+        progress_path = progress_file_for(self.out, self.src)
+        s             = self.stats
+
+        # Prefix for staged filenames — volume name with spaces stripped
+        vol_prefix = sanitize_for_windows(re.sub(r'\s+', '', self.info.label_or_name)) + '_'
+
+        # Tracks every destination filename used across ALL batches this run.
+        # Keyed by category ('Documents'/'Photos') → set of used names.
+        # Prevents cross-batch collisions in B2 where build_dest_path can't see
+        # filenames that were in a previous (already-uploaded) staging dir.
+        _used_names: dict[str, set[str]] = {'Documents': set(), 'Photos': set()}
+
+        def unique_staged_name(category: str, filename: str) -> str:
+            filename = sanitize_for_windows(filename)
+            used = _used_names[category]
+            base, ext = os.path.splitext(filename)
+            candidate = filename
+            counter = 1
+            while candidate in used:
+                candidate = f'{base}_{counter}{ext}'
+                counter += 1
+            used.add(candidate)
+            return candidate
+
+        # ── Resume set ────────────────────────────────────────────────────────
+        processed: set[str] = set()
+        if self.resume and progress_path.exists():
+            try:
+                with open(progress_path) as f:
+                    for line in f:
+                        p = line.strip()
+                        if p: processed.add(p)
+                self._log(f'  [{label}] Resuming — {len(processed):,} already done')
+            except Exception:
+                pass
+
+        # ── Set up staging / output dirs ──────────────────────────────────────
+        if use_cloud:
+            stage = self._new_stage(label)
+        else:
+            stage = None
+            os.makedirs(os.path.join(self.out, 'Documents'), exist_ok=True)
+            os.makedirs(os.path.join(self.out, 'Photos'),    exist_ok=True)
+
+        pending: list[tuple[str, str]] = []  # (src_path, md5)
+        batch_bytes = 0
+
+        def flush():
+            nonlocal batch_bytes, stage
+            if not pending: return
+            s.batches += 1
+            n = s.batches
+            job_pending = list(pending)
+            pending.clear()
+            batch_bytes = 0
+            old_stage = stage
+            # Create new staging immediately so this worker keeps reading
+            stage = self._new_stage(label)
+
+            job = UploadJob(
+                stage_dir=old_stage['dir'], pending=job_pending,
+                progress_path=progress_path, drive_label=label, batch_num=n,
+                use_b2=self.use_b2, b2_key_id=self.b2_key_id,
+                b2_app_key=self.b2_app_key, b2_bucket=self.b2_bucket,
+                use_rclone=self.use_rclone, rclone_path=self.rclone_path,
+                rclone_remote=self.rclone_remote, gd_subfolder=self.gd_subfolder,
             )
-            self._set_status(f'> cleaned {removed} orphaned temp folder(s) — {gb:.2f} GB freed')
+            self._log(f'  [{label}] ↑ Batch #{n} queued ({len(job_pending):,} files)', 'info')
+            self.coordinator.enqueue(job)
+            # Don't wait — keep reading. Disk back-pressure handles flow control.
+
+        # ── Time Machine detection & snapshot mounting (macOS only — tmutil/
+        #    diskutil don't exist elsewhere, and non-Mac drives won't have
+        #    these directories anyway) ────────────────────────────────────────
+        walk_roots = [self.src]   # replaced below for APFS TM
+        tm_mounts  = []           # snapshot mount paths to unmount when done
+
+        if IS_MAC:
+            tm_apfs = os.path.join(self.src, '.timemachine')
+            tm_hfs  = os.path.join(self.src, 'Backups.backupdb')
+            if os.path.exists(tm_apfs):
+                self._log(f'  [{label}] 🕐 APFS Time Machine detected — mounting snapshots…', 'info')
+                mounts = self._mount_tm_snapshots(label)
+                if mounts:
+                    walk_roots = mounts
+                    tm_mounts  = mounts
+                    self._log(f'  [{label}] ✓ {len(mounts)} snapshot(s) mounted — '
+                              f'walking all (dedup handles repeated files)', 'ok')
+                else:
+                    self._log(f'  [{label}] ⚠️  Could not mount snapshots — '
+                              f'check Full Disk Access in System Settings > Privacy', 'warn')
+            elif os.path.exists(tm_hfs):
+                self._log(f'  [{label}] ℹ️  HFS+ Time Machine (Backups.backupdb) — '
+                          f'walking directly, user files will be extracted', 'info')
+
+        # ── Walk source ───────────────────────────────────────────────────────
+        self._log(f'  [{label}] Scanning {self.src}  ({self.info.size_str})', 'head')
+        send_ntfy(self.ntfy_topic,
+                  f'Started: {label}  ({self.info.size_str})\n{self.info.detail_str}',
+                  title='Shinigami Eyes — Drive Started')
+
+        skip_reasons: dict[str, int] = {}   # reason → count, for end-of-walk summary
+        files_seen = 0
+
+        for walk_root in walk_roots:
+            for root, dirs, files in os.walk(walk_root, topdown=True):
+                # Prune junk dirs in-place so os.walk doesn't descend into them
+                dirs[:] = [d for d in dirs
+                           if d.lower() not in SKIP_PATH_PARTS
+                           and not d.endswith('.app')]
+
+                if not self._running(): break
+
+                for fname in files:
+                    if not self._running(): break
+                    filepath = os.path.join(root, fname)
+                    files_seen += 1
+
+                    try:
+                        fsize = os.path.getsize(filepath)
+                    except Exception:
+                        s.skipped_sys += 1
+                        skip_reasons['unreadable'] = skip_reasons.get('unreadable', 0) + 1
+                        continue
+
+                    skip, reason = should_skip(filepath, fsize)
+                    if skip:
+                        s.skipped_sys += 1
+                        skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                        self._on_progress(s)
+                        continue
+
+                    if filepath in processed:
+                        s.skipped_resume += 1
+                        skip_reasons['already done (resume)'] = skip_reasons.get('already done (resume)', 0) + 1
+                        self._on_progress(s)
+                        continue
+
+                    # Determine dest category — only files matching a known
+                    # document or image extension are migrated at all. Without
+                    # this explicit skip, anything with an unrecognized
+                    # extension (.exe, .dll, .msi, .sys, ...) fell through to
+                    # the Photos bucket by default, which is wrong.
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in DOC_EXTENSIONS:
+                        category = 'Documents'
+                    elif ext in IMAGE_EXTENSIONS:
+                        category = 'Photos'
+                    else:
+                        s.skipped_sys += 1
+                        skip_reasons['unrecognized extension'] = skip_reasons.get(
+                            'unrecognized extension', 0) + 1
+                        self._on_progress(s)
+                        continue
+
+                    if stage:
+                        dest_dir = stage['docs'] if category == 'Documents' else stage['photos']
+                    else:
+                        dest_dir = os.path.join(self.out, category)
+
+                    # Disk space back-pressure (cloud mode only)
+                    if use_cloud:
+                        waited = False
+                        while not _can_stage(fsize):
+                            if not self._running(): return
+                            if not waited:
+                                self._log(f'  [{label}] ⏳ Low disk — waiting for upload to free space...', 'warn')
+                                waited = True
+                            time.sleep(15)
+
+                    # Copy + hash (single read pass)
+                    try:
+                        h, tmp, written = copy_and_hash(filepath, dest_dir)
+                    except OSError as e:
+                        # Drive may have been removed — but macOS TCC permission
+                        # dialogs can cause a brief remount that makes the path
+                        # transiently unavailable. Retry a few times before giving up.
+                        s.errors += 1
+                        self._log(f'  [{label}] ERR {fname}: {e}', 'err')
+                        if s.errors == 1:
+                            send_ntfy(self.ntfy_topic, f'Error on {fname}: {e}',
+                                      title=f'Shinigami Eyes — Error on {label}')
+                        if not os.path.exists(self.src):
+                            drive_gone = True
+                            for _ in range(6):          # wait up to ~12s for remount
+                                time.sleep(2)
+                                if os.path.exists(self.src):
+                                    drive_gone = False
+                                    self._log(f'  [{label}] Drive re-appeared — resuming', 'info')
+                                    break
+                            if drive_gone:
+                                self._log(f'  [{label}] Drive removed — stopping this worker', 'err')
+                                return
+                        continue
+                    except Exception as e:
+                        s.errors += 1
+                        self._log(f'  [{label}] ERR {fname}: {e}', 'err')
+                        continue
+
+                    # Dedup (O(1) set lookup, no lock)
+                    if self.registry.contains(h):
+                        s.skipped_dupe += 1
+                        skip_reasons['duplicate (hash match)'] = skip_reasons.get('duplicate (hash match)', 0) + 1
+                        self._on_progress(s)
+                        try: os.unlink(tmp)
+                        except Exception: pass
+                        continue
+
+                    # Move tmp to final name — unique across ALL batches this run
+                    # (category was already determined above)
+                    final_fname = unique_staged_name(category, vol_prefix + fname)
+                    dest        = os.path.join(dest_dir, final_fname)
+                    try:
+                        shutil.move(tmp, dest)
+                    except Exception as e:
+                        s.errors += 1
+                        self._log(f'  [{label}] ERR move {fname}: {e}', 'err')
+                        continue
+
+                    s.copied      += 1
+                    s.bytes_copied += written
+                    self._on_progress(s)
+
+                    if use_cloud:
+                        # Add to in-memory set immediately so other drive workers
+                        # catch this as a dupe right away. SQLite write is deferred
+                        # to _confirm() after rclone exits 0 — so on restart,
+                        # unconfirmed files are correctly re-processed from source.
+                        self.registry._hashes.add(h)
+                        pending.append((filepath, h))
+                        batch_bytes += written
+                        if batch_bytes >= self.batch_limit:
+                            flush()
+                    else:
+                        # Local: confirm immediately
+                        self.registry.add(h, filepath)
+                        try:
+                            with open(progress_path, 'a') as pf:
+                                pf.write(filepath + '\n')
+                        except Exception:
+                            pass
+
+            if not self._running(): break
+
+        # Final flush
+        if pending and self._running():
+            flush()
+
+        self.registry.flush()
+        if stage and os.path.exists(stage['dir']):
+            shutil.rmtree(stage['dir'], ignore_errors=True)
+
+        # ── Unmount any TM snapshots we mounted ───────────────────────────────
+        for mount_path in tm_mounts:
+            try:
+                subprocess.run(['diskutil', 'unmount', mount_path],
+                               capture_output=True, timeout=30)
+                self._log(f'  [{label}] Unmounted snapshot {mount_path}', 'info')
+            except Exception as e:
+                self._log(f'  [{label}] WARN could not unmount {mount_path}: {e}', 'warn')
+
+        summary = (f'{s.copied:,} copied · {s.skipped_dupe:,} dupes ·'
+                   f' {s.skipped_resume:,} resumed · {s.errors:,} errors ·'
+                   f' {_fmt_bytes(s.bytes_copied)}')
+
+        # Walk summary — helps diagnose drives that finish unexpectedly fast
+        if files_seen == 0:
+            self._log(f'  [{label}] ⚠️  Walk found 0 files — drive may be empty, '
+                      f'unreadable, or data is in APFS snapshots (Time Machine)', 'warn')
+        elif s.copied == 0 and skip_reasons:
+            reasons_str = '  ·  '.join(f'{v:,} {k}' for k, v in
+                                       sorted(skip_reasons.items(), key=lambda x: -x[1]))
+            self._log(f'  [{label}] ℹ️  0 files copied — {files_seen:,} seen, '
+                      f'all skipped: {reasons_str}', 'warn')
+
+        self._log(f'  [{label}] ✓ DONE — {summary}', 'ok')
+        send_ntfy(
+            self.ntfy_topic,
+            f'✅ {label} complete — safe to disconnect.\n\n{summary}\n\n{self.info.detail_str}',
+            title=f'Shinigami Eyes — Disconnect {label}')
+
+    def _mount_tm_snapshots(self, label: str) -> list[str]:
+        """Mount all APFS Time Machine snapshots on self.src.
+        Returns list of mount paths, empty list on failure."""
+        try:
+            # List available snapshots
+            r = subprocess.run(
+                ['tmutil', 'listlocalsnapshotdates', '-d', self.src],
+                capture_output=True, text=True, timeout=30)
+            dates = [l.strip() for l in r.stdout.splitlines()
+                     if re.match(r'\d{4}-\d{2}-\d{2}-\d{6}', l.strip())]
+            if not dates:
+                self._log(f'  [{label}] No snapshots found on {self.src}', 'warn')
+                return []
+            self._log(f'  [{label}] Found {len(dates)} snapshot(s) — mounting…', 'info')
+
+            # Mount all snapshots; tmutil prints one line per mount
+            r2 = subprocess.run(
+                ['tmutil', 'mountlocalsnapshots', self.src],
+                capture_output=True, text=True, timeout=120)
+
+            mounts = []
+            for line in (r2.stdout + r2.stderr).splitlines():
+                # Handles: "Mounted disk image as <path>" or "mounted at: <path>"
+                m = (re.search(r'mounted (?:disk image )?as\s+(.+)', line, re.I) or
+                     re.search(r'mounted at:\s*(.+)', line, re.I))
+                if m:
+                    p = m.group(1).strip()
+                    if os.path.isdir(p):
+                        mounts.append(p)
+
+            if not mounts:
+                self._log(f'  [{label}] tmutil output: {r2.stdout.strip()[:300]}', 'warn')
+            return mounts
+        except Exception as e:
+            self._log(f'  [{label}] ERR mounting TM snapshots: {e}', 'err')
+            return []
+
+    @staticmethod
+    def _new_stage(label: str) -> dict:
+        d     = tempfile.mkdtemp(prefix=f'se_stage_{sanitize_for_windows(label)[:8]}_')
+        docs  = os.path.join(d, 'Documents')
+        photos = os.path.join(d, 'Photos')
+        os.makedirs(docs,   exist_ok=True)
+        os.makedirs(photos, exist_ok=True)
+        return {'dir': d, 'docs': docs, 'photos': photos}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# VOLUME PICKER DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VolumePicker(tk.Toplevel):
+    """Lists available volumes for multi-select (/Volumes on macOS,
+    drive letters on Windows)."""
+
+    def __init__(self, parent, already_added: set[str]):
+        super().__init__(parent)
+        self.title('Select Drives to Add')
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.selected: list[str] = []
+
+        # Scan volumes (background)
+        volumes = []
+        try:
+            if IS_WINDOWS:
+                system_drive = os.environ.get('SystemDrive', 'C:').rstrip('\\').upper()
+                for letter in list_windows_drives():
+                    if letter.rstrip('\\').upper() == system_drive:
+                        continue   # skip the OS drive by default
+                    if letter not in already_added:
+                        volumes.append(letter)
+            else:
+                vols_dir = Path('/Volumes')
+                skip_names = {'Macintosh HD', 'Preboot', 'Recovery', 'VM', 'Update', 'Data'}
+                for v in sorted(vols_dir.iterdir()):
+                    if v.is_symlink() or str(v) in already_added:
+                        continue
+                    if v.name.startswith('.'):   # hidden system mounts (.timemachine, etc.)
+                        continue
+                    if v.name in skip_names:
+                        continue
+                    if v.is_dir():
+                        volumes.append(str(v))
+        except Exception:
+            pass
+
+        scan_location = 'mounted drives' if IS_WINDOWS else '/Volumes'
+        tk.Label(self, text='Select volumes to migrate:',
+                 font=(MONO_FONT, 12, 'bold'), fg=GREEN, bg=BG).pack(padx=20, pady=(16, 8))
+
+        if not volumes:
+            tk.Label(self, text=f'No new volumes found under {scan_location}.',
+                     font=(MONO_FONT, 11), fg=MUTED, bg=BG).pack(padx=20, pady=8)
+        else:
+            frame = tk.Frame(self, bg=BG)
+            frame.pack(fill='both', expand=True, padx=20)
+            self._vars: list[tuple[tk.BooleanVar, str]] = []
+            for v in volumes:
+                var = tk.BooleanVar(value=False)
+                name = os.path.basename(v.rstrip('\\/')) or v
+                cb = tk.Checkbutton(
+                    frame, text=name, variable=var,
+                    font=(MONO_FONT, 11), fg=FG, bg=BG,
+                    selectcolor=SURFACE, activebackground=BG,
+                    activeforeground=GREEN, anchor='w')
+                cb.pack(fill='x', pady=2)
+                # Show size hint (shutil.disk_usage works cross-platform)
+                try:
+                    du = shutil.disk_usage(v)
+                    hint = f'  {_fmt_bytes(du.used)} used / {_fmt_bytes(du.total)}'
+                except Exception:
+                    hint = ''
+                if hint:
+                    tk.Label(frame, text=hint, font=(MONO_FONT, 9), fg=MUTED, bg=BG,
+                             anchor='w').pack(fill='x', padx=(20, 0))
+                self._vars.append((var, v))
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=16)
+        tk.Button(btn_row, text='Add Selected',
+                  font=(MONO_FONT, 11, 'bold'),
+                  bg=GREEN, fg='#000', activebackground='#00cc33',
+                  relief='flat', padx=14, pady=6,
+                  command=self._ok).pack(side='left', padx=8)
+        tk.Button(btn_row, text='Browse…',
+                  font=(MONO_FONT, 11), bg=SURFACE, fg=FG,
+                  relief='flat', padx=14, pady=6,
+                  command=self._browse).pack(side='left', padx=8)
+        tk.Button(btn_row, text='Cancel',
+                  font=(MONO_FONT, 11), bg=SURFACE, fg=MUTED,
+                  relief='flat', padx=14, pady=6,
+                  command=self.destroy).pack(side='left', padx=8)
+
+    def _ok(self):
+        self.selected = [v for var, v in getattr(self, '_vars', []) if var.get()]
+        self.destroy()
+
+    def _browse(self):
+        p = filedialog.askdirectory(title='Select volume / folder')
+        if p:
+            self.selected = [p]
+            self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DRIVE ROW WIDGET
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DriveRow(tk.Frame):
+    """One row in the drive list for a single source drive."""
+
+    STATUS_COLORS = {
+        'queued':    MUTED,
+        'running':   GREEN,
+        'uploading': YELLOW,
+        'done':      GREEN,
+        'aborted':   YELLOW,
+        'error':     RED,
+    }
+    STATUS_ICONS = {
+        'queued':    '○',
+        'running':   '●',
+        'uploading': '◉',
+        'done':      '✕',   # red X = safe to disconnect
+        'aborted':   '◐',
+        'error':     '✕',
+    }
+
+    def __init__(self, parent, info: DriveInfo, on_remove: Callable, **kwargs):
+        super().__init__(parent, bg=SURFACE, relief='flat',
+                         highlightbackground=BORDER, highlightthickness=1, **kwargs)
+        self.info   = info
+        self.stats  = DriveStats(label=info.label_or_name)
+
+        # ── Header row ────────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=SURFACE)
+        hdr.pack(fill='x', padx=10, pady=(8, 2))
+
+        self._icon_lbl = tk.Label(hdr, text='○', font=(MONO_FONT, 14, 'bold'),
+                                  fg=MUTED, bg=SURFACE, width=2)
+        self._icon_lbl.pack(side='left')
+
+        self._title_lbl = tk.Label(hdr,
+                                   text=f'{info.label_or_name}  —  {info.path}',
+                                   font=(MONO_FONT, 11, 'bold'), fg=FG, bg=SURFACE)
+        self._title_lbl.pack(side='left', padx=(4, 0))
+
+        tk.Button(hdr, text='×', font=(MONO_FONT, 13, 'bold'),
+                  fg=MUTED, bg=SURFACE, activeforeground=RED,
+                  relief='flat', cursor='hand2', padx=4,
+                  command=on_remove).pack(side='right')
+
+        # ── Detail row ────────────────────────────────────────────────────────
+        self._detail_lbl = tk.Label(self, text=info.detail_str,
+                                    font=(MONO_FONT, 9), fg=MUTED, bg=SURFACE,
+                                    anchor='w')
+        self._detail_lbl.pack(fill='x', padx=28, pady=(0, 2))
+
+        # ── Stats row ─────────────────────────────────────────────────────────
+        self._stats_lbl = tk.Label(self, text='Waiting to start…',
+                                   font=(MONO_FONT, 9), fg=MUTED, bg=SURFACE,
+                                   anchor='w')
+        self._stats_lbl.pack(fill='x', padx=28, pady=(0, 8))
+
+    def update_stats(self, stats: DriveStats):
+        self.stats = stats
+        color = self.STATUS_COLORS.get(stats.status, MUTED)
+        icon  = self.STATUS_ICONS.get(stats.status, '○')
+        self._icon_lbl.config(text=icon, fg=color)
+
+        if stats.status == 'done':
+            msg = (f'✓ DONE — {stats.copied:,} copied · '
+                   f'{stats.skipped_dupe:,} dupes · '
+                   f'{stats.errors:,} errors · '
+                   f'{_fmt_bytes(stats.bytes_copied)}'
+                   f'  — SAFE TO DISCONNECT')
+            self._stats_lbl.config(text=msg, fg=color)
+            self._icon_lbl.config(fg=RED)  # red X for done
+        elif stats.status == 'aborted':
+            msg = (f'◐ ABORTED — {stats.copied:,} copied · '
+                   f'{stats.skipped_dupe:,} dupes · '
+                   f'{stats.errors:,} errors · '
+                   f'{_fmt_bytes(stats.bytes_copied)}'
+                   f'  — resume on next run')
+            self._stats_lbl.config(text=msg, fg=YELLOW)
+        elif stats.status == 'error':
+            self._stats_lbl.config(text=f'ERROR: {stats.fatal}', fg=RED)
+        elif stats.status == 'running':
+            msg = (f'{stats.copied:,} copied · '
+                   f'{stats.skipped_dupe:,} dupes · '
+                   f'{stats.skipped_resume:,} skipped · '
+                   f'{stats.errors:,} errors · '
+                   f'{_fmt_bytes(stats.bytes_copied)}')
+            self._stats_lbl.config(text=msg, fg=color)
+        else:
+            self._stats_lbl.config(text=stats.status.capitalize() + '…', fg=MUTED)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN APPLICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MigrationApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f'Shinigami Eyes  v{VERSION}')
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.minsize(700, 600)
+
+        self._rclone_path = find_rclone()
+        self._gd_path     = find_gdrive()
+        self._running     = False
+        self._run_cfg:    dict = {}
+        self._semaphore:  Optional[threading.Semaphore] = None
+
+        # Shared objects (created on first run)
+        self._registry:    Optional[HashRegistry]    = None
+        self._coordinator: Optional[UploadCoordinator] = None
+
+        # Drive list: list of (DriveRow widget, DriveInfo, DriveWorker | None)
+        self._drives: list[tuple[DriveRow, DriveInfo, Optional[DriveWorker]]] = []
+        self._drive_lock = threading.Lock()
+
+        self._build_ui()
+        self.after(300, cleanup_orphan_stages)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        self._build_header()
-        self._build_form()
-        self._build_progress()
-        self._build_statusbar()
+        outer = tk.Frame(self, bg=BG, padx=24, pady=16)
+        outer.pack(fill='both', expand=True)
 
-    def _build_header(self):
-        h = tk.Frame(self, bg='#000a00', pady=14)
-        h.pack(fill='x')
-        tk.Label(h, text='[ SHINIGAMI EYES ]', font=('Menlo', 18, 'bold'),
-                 fg='#00ff41', bg='#000a00').pack(side='left', padx=20)
-        right = tk.Frame(h, bg='#000a00')
-        right.pack(side='right', padx=20)
-        tk.Label(right, text='// file migration system //', font=('Menlo', 10),
-                 fg=MUTED, bg='#000a00').pack(anchor='e')
-        tk.Label(right, text='developed by r41n403', font=('Menlo', 9),
-                 fg='#1a5c1a', bg='#000a00').pack(anchor='e')
+        # Title
+        tk.Label(outer, text='SHINIGAMI EYES',
+                 font=(MONO_FONT, 18, 'bold'), fg=GREEN, bg=BG).pack(anchor='w')
+        tk.Label(outer, text='multi-drive NAS migration tool',
+                 font=(MONO_FONT, 10), fg=MUTED, bg=BG).pack(anchor='w', pady=(0, 14))
 
-    def _build_form(self):
-        outer = tk.Frame(self, bg=BG, padx=20, pady=16)
-        outer.pack(fill='x')
+        # ── Drive list ────────────────────────────────────────────────────────
+        self._lbl(outer, 'SOURCE DRIVES').pack(anchor='w')
 
-        # ── Source drive ──────────────────────────────────────────────────────
-        self._label(outer, 'Source drive').pack(anchor='w')
-        src_row = tk.Frame(outer, bg=BG)
-        src_row.pack(fill='x', pady=(4, 14))
+        drive_container = tk.Frame(outer, bg=BG)
+        drive_container.pack(fill='x', pady=(4, 0))
 
-        self.var_source = tk.StringVar()
-        self._entry(src_row, self.var_source, width=46).pack(side='left', fill='x', expand=True)
-        self._btn(src_row, 'Browse /Volumes…', self._browse_source).pack(side='left', padx=(8, 0))
+        # Scrollable area for drive rows — starts collapsed, grows to 220 px max
+        canvas = tk.Canvas(drive_container, bg=BG, highlightthickness=0, height=0)
+        scrollbar = ttk.Scrollbar(drive_container, orient='vertical', command=canvas.yview)
+        self._drive_frame = tk.Frame(canvas, bg=BG)
 
-        # ── Destination mode ──────────────────────────────────────────────────
-        self._label(outer, 'Destination').pack(anchor='w')
-        mode_row = tk.Frame(outer, bg=BG)
-        mode_row.pack(fill='x', pady=(4, 10))
+        def _on_drive_frame_resize(e):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            canvas.configure(height=min(e.height, 220))
 
+        self._drive_frame.bind('<Configure>', _on_drive_frame_resize)
+        canvas.create_window((0, 0), window=self._drive_frame, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        self._drive_canvas = canvas
+
+        # Global totals bar (updated by workers)
+        self._totals_lbl = tk.Label(outer, text='',
+                                    font=(MONO_FONT, 10, 'bold'), fg=TEAL, bg=BG,
+                                    anchor='w')
+        self._totals_lbl.pack(fill='x', pady=(4, 0))
+
+        # Staged-for-upload counter (polled every 5s from staging dirs)
+        self._staged_lbl = tk.Label(outer, text='',
+                                    font=(MONO_FONT, 9), fg=YELLOW, bg=BG,
+                                    anchor='w')
+        self._staged_lbl.pack(fill='x')
+        self._poll_staged()
+
+        # Add drive button
+        add_row = tk.Frame(outer, bg=BG)
+        add_row.pack(fill='x', pady=(8, 14))
+        tk.Button(add_row, text='＋  Add Drives',
+                  font=(MONO_FONT, 11, 'bold'),
+                  bg=SURFACE, fg=GREEN,
+                  activebackground=BORDER, activeforeground=GREEN,
+                  relief='flat', padx=14, pady=6, cursor='hand2',
+                  command=self._add_drives).pack(side='left')
+
+        # Max parallel
+        tk.Label(add_row, text='Max parallel:',
+                 font=(MONO_FONT, 10), fg=MUTED, bg=BG).pack(side='left', padx=(20, 4))
+        self.var_workers = tk.IntVar(value=DEFAULT_WORKERS)
+        ttk.Spinbox(add_row, from_=1, to=8, width=4,
+                    textvariable=self.var_workers,
+                    font=(MONO_FONT, 10)).pack(side='left')
+
+        ttk.Separator(outer, orient='horizontal').pack(fill='x', pady=8)
+
+        # ── Destination ───────────────────────────────────────────────────────
+        self._lbl(outer, 'DESTINATION').pack(anchor='w')
         self.var_mode = tk.StringVar(value='local')
+        mode_row = tk.Frame(outer, bg=BG)
+        mode_row.pack(fill='x', pady=(4, 0))
+        rb = dict(font=(MONO_FONT, 11), fg=FG, bg=BG, selectcolor=SURFACE,
+                  activebackground=BG, activeforeground=GREEN,
+                  variable=self.var_mode, command=self._on_mode)
+        tk.Radiobutton(mode_row, text='Local Folder', value='local', **rb).pack(side='left')
+        gd_state = 'normal' if (self._gd_path or self._rclone_path) else 'disabled'
+        self._gdrive_radio = tk.Radiobutton(mode_row, text='Google Drive', value='gdrive',
+                                            state=gd_state, **rb)
+        self._gdrive_radio.pack(side='left', padx=(20, 0))
+        tk.Radiobutton(mode_row, text='Backblaze B2', value='b2', **rb).pack(side='left', padx=(20, 0))
 
-        rb_cfg = dict(bg=BG, fg=FG, activebackground=BG, activeforeground='#00ff41',
-                      selectcolor='#00ff41', font=('Menlo', 11))
-
-        tk.Radiobutton(mode_row, text='Local folder',
-                       variable=self.var_mode, value='local',
-                       command=self._on_mode_change, **rb_cfg).pack(side='left')
-
-        gd_text  = 'Google Drive' if self._gd_path else 'Google Drive (not detected)'
-        gd_state = 'normal' if self._gd_path else 'disabled'
-        tk.Radiobutton(mode_row, text=gd_text,
-                       variable=self.var_mode, value='gdrive',
-                       command=self._on_mode_change,
-                       state=gd_state, **rb_cfg).pack(side='left', padx=(20, 0))
-
-        # ── Local path panel ──────────────────────────────────────────────────
+        # Local panel
         self.panel_local = tk.Frame(outer, bg=BG)
-        self.panel_local.pack(fill='x', pady=(0, 14))
-
-        self._label(self.panel_local, 'Output folder').pack(anchor='w')
+        self.panel_local.pack(fill='x', pady=(8, 4))
+        self._lbl(self.panel_local, 'Output folder').pack(anchor='w')
         loc_row = tk.Frame(self.panel_local, bg=BG)
         loc_row.pack(fill='x', pady=(4, 0))
-
         self.var_output = tk.StringVar()
-        self._entry(loc_row, self.var_output, width=46).pack(side='left', fill='x', expand=True)
-        self._btn(loc_row, 'Choose…', self._browse_output).pack(side='left', padx=(8, 0))
+        self._entry(loc_row, self.var_output).pack(side='left', fill='x', expand=True)
+        tk.Button(loc_row, text='Browse', font=(MONO_FONT, 10),
+                  bg=SURFACE, fg=FG, relief='flat', padx=8,
+                  command=self._browse_output).pack(side='left', padx=(6, 0))
 
-        # ── Google Drive panel ────────────────────────────────────────────────
+        # GDrive panel
         self.panel_gdrive = tk.Frame(outer, bg=BG)
-        # (not packed yet — shown on mode switch)
-
         if self._gd_path:
-            tk.Label(self.panel_gdrive,
-                     text=f'Google Drive: {self._gd_path}',
-                     font=('Menlo', 10), fg=MUTED, bg=BG,
-                     wraplength=580, justify='left').pack(anchor='w')
+            tk.Label(self.panel_gdrive, text=f'Google Drive: {self._gd_path}',
+                     font=(MONO_FONT, 10), fg=MUTED, bg=BG).pack(anchor='w', pady=(8, 2))
+        self._gdrive_rclone_status = tk.Frame(self.panel_gdrive, bg=BG)
+        self._gdrive_rclone_status.pack(fill='x', pady=(6, 0))
 
-        # ── rclone status ──────────────────────────────────────────────────────
-        rclone_row = tk.Frame(self.panel_gdrive, bg=BG)
-        rclone_row.pack(fill='x', pady=(6, 0))
-
-        if self._rclone_path and self._rclone_remotes:
-            tk.Label(rclone_row, text='rclone ✓', font=('Menlo', 10, 'bold'),
-                     fg=GREEN, bg=BG).pack(side='left')
-            tk.Label(rclone_row, text=' — uploads directly to cloud (no local cache)',
-                     font=('Menlo', 10), fg=MUTED, bg=BG).pack(side='left')
-
-            remote_row = tk.Frame(self.panel_gdrive, bg=BG)
-            remote_row.pack(fill='x', pady=(6, 0))
-            self._label(remote_row, 'Remote').pack(side='left')
-            self.var_rclone_remote = tk.StringVar(value=self._rclone_remotes[0])
-            remote_menu = tk.OptionMenu(remote_row, self.var_rclone_remote,
-                                        *self._rclone_remotes)
-            remote_menu.config(font=('Menlo', 11), bg=SURFACE, fg=FG,
-                               activebackground=BORDER, activeforeground=FG,
-                               highlightthickness=0, relief='flat')
-            remote_menu['menu'].config(font=('Menlo', 11), bg=SURFACE, fg=FG)
-            remote_menu.pack(side='left', padx=(10, 0))
-        else:
-            tk.Label(rclone_row,
-                     text='rclone not found — install with: brew install rclone && rclone config',
-                     font=('Menlo', 10), fg=YELLOW, bg=BG,
-                     wraplength=560, justify='left').pack(anchor='w')
-            self.var_rclone_remote = tk.StringVar(value='')
+        remote_row = tk.Frame(self.panel_gdrive, bg=BG)
+        remote_row.pack(fill='x', pady=(6, 0))
+        tk.Label(remote_row, text='Remote name:', font=(MONO_FONT, 10), fg=FG, bg=BG).pack(side='left')
+        self.var_rclone_remote = tk.StringVar(value='gdrive')
+        self._entry(remote_row, self.var_rclone_remote, width=14).pack(side='left', padx=(8, 0))
 
         gd_sub_row = tk.Frame(self.panel_gdrive, bg=BG)
         gd_sub_row.pack(fill='x', pady=(8, 4))
-        self._label(gd_sub_row, 'Subfolder name').pack(side='left')
+        tk.Label(gd_sub_row, text='Subfolder:', font=(MONO_FONT, 10), fg=FG, bg=BG).pack(side='left')
         self.var_gd_sub = tk.StringVar(value='NAS Migration')
-        self._entry(gd_sub_row, self.var_gd_sub, width=28).pack(side='left', padx=(10, 0))
+        self._entry(gd_sub_row, self.var_gd_sub, width=22).pack(side='left', padx=(8, 0))
 
-        info_text = (
-            f'Files are staged locally in {BATCH_LIMIT_GB} GB batches, then '
-            'uploaded to Google Drive via rclone and removed from local storage.'
-            if (self._rclone_path and self._rclone_remotes) else
-            f'Files are staged locally in {BATCH_LIMIT_GB} GB batches, '
-            'then moved to Google Drive automatically.'
-        )
-        tk.Label(self.panel_gdrive, text=info_text,
-                 font=('Helvetica Neue', 10), fg=MUTED, bg=BG,
-                 wraplength=580, justify='left').pack(anchor='w', pady=(0, 14))
+        # B2 panel
+        _b2 = load_b2_config()
+        self.panel_b2 = tk.Frame(outer, bg=BG)
+        self.var_b2_key_id    = tk.StringVar(value=_b2.get('key_id', ''))
+        self.var_b2_app_key   = tk.StringVar(value=_b2.get('app_key', ''))
+        self.var_b2_bucket    = tk.StringVar(value=_b2.get('bucket', ''))
+        self.var_b2_subfolder = tk.StringVar(value=_b2.get('subfolder', 'NAS Migration'))
 
-        # ── Action buttons ────────────────────────────────────────────────────
+        def _b2_row(label, var, mask=False):
+            row = tk.Frame(self.panel_b2, bg=BG)
+            row.pack(fill='x', pady=(4, 0))
+            tk.Label(row, text=f'{label}:', font=(MONO_FONT, 10), fg=FG, bg=BG,
+                     width=12, anchor='e').pack(side='left')
+            kw = {'show': '●'} if mask else {}
+            self._entry(row, var, width=36, **kw).pack(side='left', padx=(8, 0))
+        self._b2_rclone_status = tk.Frame(self.panel_b2, bg=BG)
+        self._b2_rclone_status.pack(fill='x', pady=(8, 4))
+        _b2_row('Key ID',    self.var_b2_key_id)
+        _b2_row('App Key',   self.var_b2_app_key, mask=True)
+        _b2_row('Bucket',    self.var_b2_bucket)
+        _b2_row('Subfolder', self.var_b2_subfolder)
+        tk.Label(self.panel_b2,
+                 text=f'Files staged in {BATCH_LIMIT_GB} GB batches, uploaded via rclone.',
+                 font=(MONO_FONT, 9), fg=MUTED, bg=BG).pack(anchor='w', pady=(8, 4))
+
+        self._refresh_rclone_status()
+
+        ttk.Separator(outer, orient='horizontal').pack(fill='x', pady=8)
+
+        # ── ntfy ──────────────────────────────────────────────────────────────
+        ntfy_row = tk.Frame(outer, bg=BG)
+        ntfy_row.pack(fill='x', pady=(0, 10))
+        self._ntfy_row = ntfy_row
+        self._lbl(ntfy_row, 'ntfy topic').pack(side='left')
+        tk.Label(ntfy_row, text='(optional)', font=(MONO_FONT, 9), fg=MUTED, bg=BG).pack(side='left', padx=6)
+        _cfg = load_app_config()
+        self.var_ntfy = tk.StringVar(value=_cfg.get('ntfy_topic', ''))
+        self._entry(ntfy_row, self.var_ntfy, width=30).pack(side='left', padx=(10, 0))
+
         ttk.Separator(outer).pack(fill='x', pady=4)
-        btn_row = tk.Frame(outer, bg=BG, pady=12)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_row = tk.Frame(outer, bg=BG, pady=10)
         btn_row.pack()
-
-        self.btn_start = tk.Button(
-            btn_row, text='▶  EXECUTE',
-            font=('Menlo', 13, 'bold'),
-            bg='#00ff41', fg='#000000', activebackground='#00cc33', activeforeground='#000000',
+        self.btn_start = tk.Button(btn_row, text='▶  EXECUTE',
+            font=(MONO_FONT, 13, 'bold'), bg=GREEN, fg='#000',
+            activebackground='#00cc33', activeforeground='#000',
             relief='flat', padx=22, pady=9, cursor='hand2',
-            command=self._start,
-        )
-        self.btn_start.pack(side='left')
-
-        self.btn_stop = tk.Button(
-            btn_row, text='■  ABORT',
-            font=('Menlo', 13, 'bold'),
-            bg='#ff2222', fg='#000000', activebackground='#cc0000', activeforeground='#000000',
+            command=self._start)
+        self.btn_start.pack(side='left', padx=(0, 12))
+        self.btn_stop = tk.Button(btn_row, text='■  ABORT',
+            font=(MONO_FONT, 13, 'bold'), bg=SURFACE, fg=MUTED,
+            activebackground='#330000', activeforeground=RED,
             relief='flat', padx=22, pady=9, cursor='hand2',
-            state='disabled', command=self._stop,
-        )
-        self.btn_stop.pack(side='left', padx=(12, 0))
+            state='disabled', command=self._stop)
+        self.btn_stop.pack(side='left')
 
-    def _build_progress(self):
-        frame = tk.Frame(self, bg=BG, padx=20)
-        frame.pack(fill='both', expand=True, pady=(0, 4))
+        # ── Status + log ──────────────────────────────────────────────────────
+        self.var_status = tk.StringVar(value='Ready')
+        tk.Label(outer, textvariable=self.var_status,
+                 font=(MONO_FONT, 10), fg=TEAL, bg=BG, anchor='w').pack(fill='x', pady=(8, 2))
 
-        header = tk.Frame(frame, bg=BG)
-        header.pack(fill='x', pady=(0, 6))
-        self._label(header, 'Progress').pack(side='left')
+        self.log_box = tk.Text(outer, height=14, bg=SURFACE, fg=FG,
+                               font=(MONO_FONT, 10), relief='flat',
+                               state='disabled', wrap='word')
+        self.log_box.pack(fill='both', expand=True, pady=(2, 0))
+        sb = ttk.Scrollbar(self.log_box, command=self.log_box.yview)
+        self.log_box['yscrollcommand'] = sb.set
 
-        self.btn_clear = tk.Button(header, text='[ clear ]',
-                                   font=('Menlo', 10), fg=MUTED,
-                                   bg=BG, activebackground=SURFACE,
-                                   activeforeground=FG,
-                                   relief='flat', cursor='hand2',
-                                   command=self._clear_log)
-        self.btn_clear.pack(side='right')
+        # Log tags
+        for tag, color in [('ok', GREEN), ('err', RED), ('warn', YELLOW),
+                            ('gd', TEAL), ('head', TEAL), ('info', FG)]:
+            self.log_box.tag_config(tag, foreground=color)
 
-        self.log_box = scrolledtext.ScrolledText(
-            frame, font=('Menlo', 10),
-            bg='#000a00', fg='#00cc33', insertbackground=FG,
-            relief='flat', borderwidth=0,
-            state='disabled',
-        )
-        self.log_box.pack(fill='both', expand=True)
+        self._on_mode()
 
-        self.log_box.tag_config('ok',   foreground=GREEN)
-        self.log_box.tag_config('skip', foreground=YELLOW)
-        self.log_box.tag_config('err',  foreground=RED)
-        self.log_box.tag_config('info', foreground=ACCENT)
-        self.log_box.tag_config('head', foreground=PURPLE, font=('Menlo', 10, 'bold'))
-        self.log_box.tag_config('gd',   foreground=TEAL)
+    def _lbl(self, parent, text):
+        return tk.Label(parent, text=text, font=(MONO_FONT, 9, 'bold'),
+                        fg=MUTED, bg=BG)
 
-    def _build_statusbar(self):
-        bar = tk.Frame(self, bg='#000a00', pady=6)
-        bar.pack(fill='x', side='bottom')
-        self.var_status = tk.StringVar(value='> ready_')
-        tk.Label(bar, textvariable=self.var_status,
-                 font=('Menlo', 10), fg=MUTED, bg='#000a00',
-                 anchor='w').pack(side='left', padx=16)
-
-    # ── Widget factories ──────────────────────────────────────────────────────
-
-    def _label(self, parent, text):
-        return tk.Label(parent, text=text, font=('Menlo', 11, 'bold'),
-                        fg=FG, bg=BG)
-
-    def _entry(self, parent, var, width=40):
+    def _entry(self, parent, var, width=40, **kw):
         return tk.Entry(parent, textvariable=var, width=width,
-                        font=('Menlo', 11), bg='#000a00', fg='#00ff41',
-                        insertbackground='#00ff41', relief='flat',
-                        highlightthickness=1, highlightcolor='#00ff41',
-                        highlightbackground=BORDER)
+                        bg=SURFACE, fg=FG, insertbackground=GREEN,
+                        relief='flat', font=(MONO_FONT, 10), **kw)
 
-    def _btn(self, parent, text, cmd):
-        return tk.Button(parent, text=text, command=cmd,
-                         font=('Menlo', 11),
-                         bg=SURFACE, fg='#00ff41', activebackground=BORDER,
-                         activeforeground='#00ff41',
-                         relief='flat', padx=12, pady=5, cursor='hand2')
-
-    # ── Mode switch ───────────────────────────────────────────────────────────
-
-    def _on_mode_change(self):
-        if self.var_mode.get() == 'local':
-            self.panel_gdrive.pack_forget()
-            self.panel_local.pack(fill='x', pady=(0, 14),
-                                  before=self.btn_start.master.master)  # reinsert above separator
-        else:
-            self.panel_local.pack_forget()
-            self.panel_gdrive.pack(fill='x', pady=(0, 0),
-                                   before=self.btn_start.master.master)
-
-    # ── Actions ───────────────────────────────────────────────────────────────
-
-    def _browse_source(self):
-        path = filedialog.askdirectory(initialdir='/Volumes',
-                                       title='Select source drive or folder')
-        if path:
-            self.var_source.set(path)
+    def _on_mode(self):
+        mode = self.var_mode.get()
+        ref  = self._ntfy_row
+        self.panel_local.pack_forget()
+        self.panel_gdrive.pack_forget()
+        self.panel_b2.pack_forget()
+        if mode == 'local':
+            self.panel_local.pack(fill='x', pady=(8, 4), before=ref)
+        elif mode == 'gdrive':
+            self.panel_gdrive.pack(fill='x', pady=(8, 4), before=ref)
+        elif mode == 'b2':
+            self.panel_b2.pack(fill='x', pady=(8, 4), before=ref)
 
     def _browse_output(self):
-        path = filedialog.askdirectory(title='Select output folder')
-        if path:
-            self.var_output.set(path)
+        p = filedialog.askdirectory(title='Select output folder')
+        if p: self.var_output.set(p)
 
-    def _clear_log(self):
-        self.log_box.config(state='normal')
-        self.log_box.delete('1.0', 'end')
-        self.log_box.config(state='disabled')
+    # ── rclone status / auto-install ─────────────────────────────────────────
+
+    def _refresh_rclone_status(self):
+        """(Re)build the rclone found/not-found row in both the Google Drive
+        and B2 panels, and update the Google Drive radio button's enabled
+        state. Called at startup and again after an install attempt."""
+        for container in (self._gdrive_rclone_status, self._b2_rclone_status):
+            for child in container.winfo_children():
+                child.destroy()
+            if self._rclone_path:
+                tk.Label(container, text='✓ rclone found', font=(MONO_FONT, 10),
+                         fg=GREEN, bg=BG).pack(side='left')
+            else:
+                tk.Label(container, text=f'rclone not found — install: {RCLONE_INSTALL_HINT}',
+                         font=(MONO_FONT, 10), fg=YELLOW, bg=BG).pack(side='left')
+                if IS_WINDOWS:
+                    tk.Button(container, text='Install via winget',
+                              font=(MONO_FONT, 9, 'bold'), bg=SURFACE, fg=GREEN,
+                              activebackground=BORDER, activeforeground=GREEN,
+                              relief='flat', padx=8, pady=2, cursor='hand2',
+                              command=self._install_rclone).pack(side='left', padx=(10, 0))
+
+        gd_state = 'normal' if (self._gd_path or self._rclone_path) else 'disabled'
+        self._gdrive_radio.config(state=gd_state)
+
+    def _install_rclone(self):
+        self._log('── Installing rclone via winget…', 'head')
+        threading.Thread(target=self._install_rclone_bg, daemon=True).start()
+
+    def _install_rclone_bg(self):
+        install_rclone_winget(log_fn=self._log)   # logs its own progress/result
+        self._rclone_path = find_rclone()
+        self.after(0, self._refresh_rclone_status)
+
+    # ── Drive management ──────────────────────────────────────────────────────
+
+    def _add_drives(self):
+        already = {info.path for _, info, _ in self._drives}
+        picker = VolumePicker(self, already)
+        self.wait_window(picker)
+        for path in picker.selected:
+            if path and path not in already:
+                self._log(f'  Loading info for {os.path.basename(path)}…', 'gd')
+                threading.Thread(target=self._add_drive_bg, args=(path,),
+                                 daemon=True).start()
+
+    def _add_drive_bg(self, path: str):
+        info = get_drive_info(path)
+        self.after(0, lambda: self._add_drive_row(info))
+
+    def _add_drive_row(self, info: DriveInfo):
+        row = DriveRow(
+            self._drive_frame, info,
+            on_remove=lambda: self._remove_drive(info.path))
+        row.pack(fill='x', pady=(0, 4))
+        with self._drive_lock:
+            self._drives.append((row, info, None))
+        self._drive_canvas.configure(scrollregion=self._drive_canvas.bbox('all'))
+        self._log(f'  Added: {info.label_or_name}  —  {info.detail_str}', 'info')
+
+        # Auto-start worker if a run is already active
+        if self._running and hasattr(self, '_run_cfg') and self._run_cfg:
+            self._log(f'  [{info.label_or_name}] Hot-adding to active run…', 'gd')
+            threading.Thread(
+                target=self._launch_worker, args=(row, info, False),
+                daemon=True).start()
+
+    def _remove_drive(self, path: str):
+        with self._drive_lock:
+            for i, (row, info, worker) in enumerate(self._drives):
+                if info.path == path:
+                    row.pack_forget()
+                    row.destroy()
+                    self._drives.pop(i)
+                    break
+
+    # ── Start / Stop ──────────────────────────────────────────────────────────
 
     def _start(self):
-        raw_source = self.var_source.get().strip()
-        if not raw_source:
-            messagebox.showwarning('Missing input', 'Please enter or browse for a source drive.')
+        if not self._drives:
+            messagebox.showwarning('No drives', 'Add at least one source drive first.')
             return
 
-        # Resolve source path
-        if os.path.isdir(raw_source):
-            source_path = raw_source
-        elif os.path.isdir(f'/Volumes/{raw_source}'):
-            source_path = f'/Volumes/{raw_source}'
-        else:
-            vols = ', '.join(os.listdir('/Volumes')) if os.path.isdir('/Volumes') else 'none'
-            messagebox.showerror('Drive not found',
-                f"Cannot find '{raw_source}'.\n\nAvailable volumes: {vols}")
-            return
+        mode       = self.var_mode.get()
+        use_gdrive = (mode == 'gdrive')
+        use_b2     = (mode == 'b2')
+        use_rclone = False
+        rclone_remote = ''
+        gd_subfolder  = ''
+        output_path   = ''
+        b2_key_id = b2_app_key = b2_bucket = ''
 
-        use_gdrive = (self.var_mode.get() == 'gdrive')
+        if use_b2:
+            if not self._rclone_path:
+                if IS_WINDOWS:
+                    if messagebox.askyesno(
+                        'rclone required',
+                        'rclone is required for Backblaze B2 and was not found.\n\n'
+                        'Install it now via winget?'):
+                        self._install_rclone()
+                        messagebox.showinfo(
+                            'Installing…',
+                            'Installing rclone in the background — watch the log below.\n'
+                            'Click Execute again once it finishes.')
+                    return
+                messagebox.showerror('rclone required',
+                    f'Install rclone: {RCLONE_INSTALL_HINT}')
+                return
+            b2_key_id    = self.var_b2_key_id.get().strip()
+            b2_app_key   = self.var_b2_app_key.get().strip()
+            b2_bucket    = self.var_b2_bucket.get().strip()
+            gd_subfolder = self.var_b2_subfolder.get().strip() or 'NAS Migration'
+            if not b2_key_id or not b2_app_key or not b2_bucket:
+                messagebox.showwarning('Missing B2 credentials',
+                    'Fill in Key ID, App Key, and Bucket name.')
+                return
+            save_b2_config(b2_key_id, b2_app_key, b2_bucket, gd_subfolder)
+            output_path = f'b2:{b2_bucket}/{gd_subfolder}'
 
-        if use_gdrive:
-            subfolder     = self.var_gd_sub.get().strip() or 'NAS Migration'
+        elif use_gdrive:
+            gd_subfolder  = self.var_gd_sub.get().strip() or 'NAS Migration'
             rclone_remote = self.var_rclone_remote.get().strip()
             use_rclone    = bool(self._rclone_path and rclone_remote)
-
-            if use_rclone:
-                # rclone mode: output_path is a stable key for the progress file
-                output_path = f'rclone:{rclone_remote}/{subfolder}'
-            else:
-                if not self._gd_path:
-                    messagebox.showerror('Google Drive not found',
-                        'Google Drive for Desktop does not appear to be installed or signed in.\n\n'
-                        'Install rclone (brew install rclone && rclone config) or install '
-                        'Google Drive for Desktop.')
-                    return
-                output_path = os.path.join(self._gd_path, subfolder)
+            output_path   = (f'rclone:{rclone_remote}/{gd_subfolder}' if use_rclone
+                             else os.path.join(self._gd_path or '', gd_subfolder))
         else:
-            use_rclone    = False
-            rclone_remote = ''
             output_path = self.var_output.get().strip()
             if not output_path:
-                messagebox.showwarning('Missing input', 'Please choose an output folder.')
+                messagebox.showwarning('Missing output', 'Choose an output folder.')
+                return
+            os.makedirs(output_path, exist_ok=True)
+
+        ntfy_topic = self.var_ntfy.get().strip()
+        if ntfy_topic:
+            save_app_config(ntfy_topic=ntfy_topic)
+
+        # ── Sanity check cloud (runs subprocess — keep on main thread before UI lock) ──
+        if use_b2:
+            if not self._check_b2(b2_key_id, b2_app_key, b2_bucket):
+                return
+        elif use_rclone:
+            if not self._check_rclone(rclone_remote):
                 return
 
-        # ── Check for a previous session (state files are always local) ─────
-        # rclone output_path is a remote key, not a local path — don't mkdir it
-        if not use_rclone:
-            os.makedirs(output_path, exist_ok=True)
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        progress_path = progress_file_for(output_path)
-        hash_db_path  = HASH_DB_FILE
+        # ── Resume dialogs must be on main thread (messagebox requirement) ────
+        with self._drive_lock:
+            entries = list(self._drives)
 
-        resume = False
-        if os.path.exists(progress_path):
-            try:
-                with open(progress_path) as f:
-                    done_count = sum(1 for line in f if line.strip())
-            except Exception:
-                done_count = 0
-
-            answer = messagebox.askquestion(
-                'Resume previous session?',
-                f'{done_count:,} files were already processed in a previous run.\n\n'
-                '[ YES ]  Resume — skip already-processed files, pick up where it stopped.\n\n'
-                '[ NO ]   Start fresh — rescan everything. Cross-drive duplicate\n'
-                '         hashes are always kept regardless.',
-                icon='question',
-            )
-            resume = (answer == 'yes')
-            if not resume:
+        resume_map: dict[str, bool] = {}
+        for _, info, _ in entries:
+            prog = progress_file_for(output_path, info.path)
+            resume_map[info.path] = False
+            if prog.exists():
                 try:
-                    os.remove(progress_path)
+                    with open(prog) as f:
+                        done_count = sum(1 for l in f if l.strip())
                 except Exception:
-                    pass
+                    done_count = 0
+                if done_count:
+                    ans = messagebox.askquestion(
+                        'Resume?',
+                        f'{info.label_or_name}: {done_count:,} files already done.\n\n'
+                        'YES = resume (skip already-done files)\n'
+                        'NO  = start fresh')
+                    resume_map[info.path] = (ans == 'yes')
+                    if not resume_map[info.path]:
+                        try: os.remove(prog)
+                        except Exception: pass
+                else:
+                    self._log(f'  [{info.label_or_name}] No previous session — starting fresh', 'info')
+            else:
+                self._log(f'  [{info.label_or_name}] No previous session — starting fresh', 'info')
 
-        # ── Launch ────────────────────────────────────────────────────────────
+        # ── Lock UI and hand off to background thread ─────────────────────────
         self._running = True
         self.btn_start.config(state='disabled')
         self.btn_stop.config(state='normal')
-        self._clear_log()
+        self._set_status('> running…')
 
-        self._thread = threading.Thread(
-            target=self._run,
-            args=(source_path, output_path, use_gdrive, resume, use_rclone, rclone_remote, subfolder if use_gdrive else ''),
+        threading.Thread(
+            target=self._do_start,
+            args=(entries, resume_map, output_path,
+                  use_gdrive, use_rclone, use_b2,
+                  rclone_remote, gd_subfolder,
+                  b2_key_id, b2_app_key, b2_bucket,
+                  ntfy_topic, self.var_workers.get()),
             daemon=True,
+            name='setup',
+        ).start()
+
+    def _do_start(self, entries, resume_map, output_path,
+                  use_gdrive, use_rclone, use_b2,
+                  rclone_remote, gd_subfolder,
+                  b2_key_id, b2_app_key, b2_bucket,
+                  ntfy_topic, max_workers):
+        """Heavy setup: registry, coordinator, workers. Runs in background thread."""
+
+        # Registry
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if self._registry is None:
+            self._log('  Opening hash registry…', 'info')
+            self._registry = HashRegistry(HASH_DB_FILE)
+            n = self._registry.open()
+            self._log(f'  ✓ Hash registry ready — {n:,} existing hashes', 'ok')
+
+        # Pull hashes from any other machine sharing this B2 bucket, so this
+        # run doesn't re-upload files another machine already confirmed.
+        if use_b2 and self._rclone_path:
+            self._log('  Syncing shared hash registry from B2…', 'info')
+            merged = pull_remote_hashes(
+                self._registry, self._rclone_path,
+                b2_key_id, b2_app_key, b2_bucket,
+                get_machine_id(), log_fn=self._log)
+            if merged:
+                self._log(f'  ✓ Merged {merged:,} hash(es) from other machine(s)', 'ok')
+            else:
+                self._log('  ✓ No new remote hashes to merge', 'info')
+
+        # Upload coordinator
+        if self._coordinator is not None:
+            self._coordinator.stop()
+        self._coordinator = UploadCoordinator(self._log, self._registry)
+        self._coordinator.start()
+
+        # Store run config so hot-added drives can pick it up
+        self._run_cfg = dict(
+            output_path=output_path, use_gdrive=use_gdrive,
+            use_rclone=use_rclone, use_b2=use_b2,
+            rclone_remote=rclone_remote, gd_subfolder=gd_subfolder,
+            b2_key_id=b2_key_id, b2_app_key=b2_app_key, b2_bucket=b2_bucket,
+            ntfy_topic=ntfy_topic,
         )
-        self._thread.start()
+        self._semaphore = threading.Semaphore(max_workers)
 
-    def _stop(self):
-        self._running = False
-        self._set_status('> aborting after current file...')
+        for row, info, _ in entries:
+            self._launch_worker(row, info, resume_map.get(info.path, False))
 
-    def _run(self, source_path, output_path, use_gdrive, resume=False,
-             use_rclone=False, rclone_remote='', gd_subfolder=''):
+        # Poll until all workers done (allows hot-add mid-run)
+        while self._running:
+            time.sleep(2)
+            with self._drive_lock:
+                alive = [w for _, _, w in self._drives
+                         if w is not None and w.is_alive()]
+            if not alive:
+                break
+
+        self.after(0, self._all_done)
+
+    def _launch_worker(self, row: 'DriveRow', info: DriveInfo, resume: bool):
+        """Spawn a worker for one drive. Safe to call mid-run."""
+        cfg = self._run_cfg
+        worker = DriveWorker(
+            source_path=info.path, output_path=cfg['output_path'], info=info,
+            registry=self._registry, coordinator=self._coordinator,
+            use_gdrive=cfg['use_gdrive'], use_rclone=cfg['use_rclone'],
+            use_b2=cfg['use_b2'], rclone_path=self._rclone_path or '',
+            rclone_remote=cfg['rclone_remote'], gd_subfolder=cfg['gd_subfolder'],
+            b2_key_id=cfg['b2_key_id'], b2_app_key=cfg['b2_app_key'],
+            b2_bucket=cfg['b2_bucket'], log_fn=self._log,
+            on_done=lambda s, r=row: self.after(0, lambda: self._drive_done(r, s)),
+            on_progress=lambda s, r=row: self._on_progress_throttled(r, s),
+            ntfy_topic=cfg['ntfy_topic'], resume=resume,
+            running_ref=lambda: self._running,
+        )
+        with self._drive_lock:
+            for i, (r2, info2, _) in enumerate(self._drives):
+                if info2.path == info.path:
+                    self._drives[i] = (r2, info2, worker)
+                    break
+
+        def _launch(w=worker):
+            self._semaphore.acquire()
+            try:
+                w._run()
+            finally:
+                self._semaphore.release()
+
+        t = threading.Thread(target=_launch, daemon=True,
+                             name=f'slot-{info.label_or_name[:8]}')
+        t.start()
+        self.after(0, lambda r=row, w=worker: r.update_stats(w.stats))
+
+    def _monitor(self, threads: list):
+        for t in threads:
+            t.join()
+        self.after(0, self._all_done)
+
+    def _on_progress_throttled(self, row: DriveRow, stats: DriveStats):
+        """Called from worker thread (already throttled per-drive in DriveWorker)."""
+        self.after(0, lambda: self._apply_progress(row, stats))
+
+    def _apply_progress(self, row: DriveRow, stats: DriveStats):
+        row.update_stats(stats)
+        self._update_totals()
+
+    def _update_totals(self):
+        with self._drive_lock:
+            all_stats = [w.stats for _, _, w in self._drives if w is not None]
+        if not all_stats:
+            self._totals_lbl.config(text='')
+            return
+        copied  = sum(s.copied        for s in all_stats)
+        dupes   = sum(s.skipped_dupe  for s in all_stats)
+        skipped = sum(s.skipped_resume + s.skipped_sys for s in all_stats)
+        errors  = sum(s.errors        for s in all_stats)
+        total_b = sum(s.bytes_copied  for s in all_stats)
+        self._totals_lbl.config(
+            text=f'TOTAL  ·  {copied:,} copied  ·  {dupes:,} dupes  ·  '
+                 f'{skipped:,} skipped  ·  {errors:,} errors  ·  {_fmt_bytes(total_b)}')
+
+    def _poll_staged(self):
+        """Scan staging dirs every 5s and update the staged-bytes label."""
+        total = 0
+        tmpdir = tempfile.gettempdir()
         try:
-            self._migrate(source_path, output_path, use_gdrive, resume,
-                          use_rclone, rclone_remote, gd_subfolder)
-        except Exception as e:
-            self._log(f'  FATAL: {e}', 'err')
-        finally:
-            self.after(0, self._on_done)
+            for entry in os.scandir(tmpdir):
+                if entry.name.startswith('se_stage_'):
+                    for root, _, files in os.walk(entry.path):
+                        for f in files:
+                            try:
+                                total += os.path.getsize(os.path.join(root, f))
+                            except OSError:
+                                pass
+        except OSError:
+            pass
 
-    def _on_done(self):
+        if total > 0:
+            self._staged_lbl.config(text=f'⏳ staged for upload  ·  {_fmt_bytes(total)}')
+        else:
+            self._staged_lbl.config(text='')
+
+        self.after(5000, self._poll_staged)
+
+    def _drive_done(self, row: DriveRow, stats: DriveStats):
+        row.update_stats(stats)
+        self._update_totals()
+
+    def _all_done(self):
+        was_aborted = not self._running   # _stop() sets this False before we get here
         self._running = False
         self.btn_start.config(state='normal')
         self.btn_stop.config(state='disabled')
+        if was_aborted:
+            self._set_status('> aborted')
+            self._log('\n══ Run aborted ══', 'warn')
+        else:
+            self._set_status('> all drives complete')
+            self._log('\n══ All drives finished ══', 'ok')
+        self._update_totals()
+        if self._coordinator:
+            self._coordinator.stop()
+        if self._registry:
+            self._registry.flush()
+            cfg = self._run_cfg or {}
+            if cfg.get('use_b2') and self._rclone_path:
+                self._registry.checkpoint()
+                self._log('  ↑ Final hash DB sync to B2 queued…', 'info')
+                threading.Thread(
+                    target=push_local_hashes,
+                    args=(self._rclone_path, cfg['b2_key_id'], cfg['b2_app_key'],
+                         cfg['b2_bucket'], get_machine_id()),
+                    kwargs={'log_fn': self._log},
+                    daemon=True,
+                ).start()
 
-    # ── Logging helpers ───────────────────────────────────────────────────────
+    def _stop(self):
+        self._running = False
+        self._set_status('> aborting…')
 
-    def _log(self, msg, tag=''):
+    # ── Cloud sanity checks ───────────────────────────────────────────────────
+
+    def _check_b2(self, key_id, app_key, bucket) -> bool:
+        self._log('── Checking Backblaze B2 connection…', 'head')
+        try:
+            r = subprocess.run(
+                [self._rclone_path, 'lsd', ':b2:',
+                 f'--b2-account={key_id}', f'--b2-key={app_key}'],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                self._log(f'  ERR  B2 auth failed: {r.stderr.strip()[:300]}', 'err')
+                return False
+            if bucket not in r.stdout:
+                self._log(f'  ERR  Bucket "{bucket}" not found. Available:\n{r.stdout.strip()[:300]}', 'err')
+                return False
+            self._log(f'  B2 OK — bucket {bucket} found', 'ok')
+            return True
+        except subprocess.TimeoutExpired:
+            self._log('  ERR  B2 check timed out', 'err')
+            return False
+        except Exception as e:
+            self._log(f'  ERR  B2 check: {e}', 'err')
+            return False
+
+    def _check_rclone(self, remote) -> bool:
+        self._log('── Checking rclone / Google Drive…', 'head')
+        try:
+            r = subprocess.run(
+                [self._rclone_path, 'about', f'{remote}:'],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                self._log(f'  ERR  rclone: {r.stderr.strip()[:300]}', 'err')
+                return False
+            self._log(f'  rclone OK — {remote}:', 'ok')
+            return True
+        except subprocess.TimeoutExpired:
+            self._log('  ERR  rclone timed out', 'err')
+            return False
+        except Exception as e:
+            self._log(f'  ERR  rclone: {e}', 'err')
+            return False
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+
+    def _log(self, msg: str, tag: str = ''):
         def _do():
             self.log_box.config(state='normal')
             self.log_box.insert('end', msg + '\n', tag or ())
@@ -645,389 +2275,18 @@ class App(tk.Tk):
             self.log_box.config(state='disabled')
         self.after(0, _do)
 
-    def _set_status(self, msg):
+    def _set_status(self, msg: str):
         self.after(0, lambda: self.var_status.set(msg))
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # MIGRATION LOGIC
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _migrate(self, source_path, output_path, use_gdrive, resume=False,
-                 use_rclone=False, rclone_remote='', gd_subfolder=''):
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-        copied = skipped_dupe = skipped_sys = skipped_resume = errors = batches = 0
-        batch_bytes = 0
-
-        # ── Persistent state file paths (always local, never on GDrive/NAS) ──
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        hash_db_path  = HASH_DB_FILE
-        progress_path = progress_file_for(output_path)
-
-        # ── Load existing hash DB (always — enables cross-drive dedup) ────────
-        seen_hashes = {}   # md5 → original source path
-        if os.path.exists(hash_db_path):
-            try:
-                with open(hash_db_path, 'r', errors='replace') as f:
-                    for line in f:
-                        line = line.strip()
-                        if '|' in line:
-                            h, _, src = line.partition('|')
-                            if h and src:
-                                seen_hashes[h] = src
-            except Exception:
-                pass
-
-        # ── Load progress log (resume mode only) ─────────────────────────────
-        processed_paths = set()   # source paths already handled in a prior run
-        if resume and os.path.exists(progress_path):
-            try:
-                with open(progress_path, 'r', errors='replace') as f:
-                    for line in f:
-                        p = line.strip()
-                        if p:
-                            processed_paths.add(p)
-            except Exception:
-                pass
-
-        # ── Set up directories ────────────────────────────────────────────────
-        if use_gdrive:
-            stage_dir    = tempfile.mkdtemp(prefix='nas_migrate_stage_')
-            stage_docs   = os.path.join(stage_dir, 'Documents')
-            stage_photos = os.path.join(stage_dir, 'Photos')
-            os.makedirs(stage_docs,   exist_ok=True)
-            os.makedirs(stage_photos, exist_ok=True)
-            if not use_rclone:
-                # Legacy mode: move files into local GDrive folder
-                gd_docs   = os.path.join(output_path, 'Documents')
-                gd_photos = os.path.join(output_path, 'Photos')
-                os.makedirs(gd_docs,   exist_ok=True)
-                os.makedirs(gd_photos, exist_ok=True)
-            docs_dir   = stage_docs
-            photos_dir = stage_photos
-            log_path   = STATE_DIR / f'migration_log_{timestamp}.txt'
-        else:
-            docs_dir   = os.path.join(output_path, 'Documents')
-            photos_dir = os.path.join(output_path, 'Photos')
-            os.makedirs(docs_dir,   exist_ok=True)
-            os.makedirs(photos_dir, exist_ok=True)
-            log_path   = os.path.join(output_path, f'migration_log_{timestamp}.txt')
-
-        log_lines = []
-
-        def log(msg, tag=''):
-            self._log(msg, tag)
-            log_lines.append(msg)
-
-        # ── Open persistent files for appending ───────────────────────────────
-        try:
-            hash_fh     = open(hash_db_path,  'a', buffering=1)
-            progress_fh = open(progress_path, 'a', buffering=1)
-        except Exception as e:
-            log(f'  FATAL  Cannot open state files: {e}', 'err')
-            return
-
-        def mark_done(filepath):
-            """Record a source path as fully processed."""
-            processed_paths.add(filepath)
-            progress_fh.write(filepath + '\n')
-
-        def confirm_batch(batch):
-            """Write hashes + mark done for a confirmed-uploaded batch."""
-            for src_fp, src_hash in batch:
-                hash_fh.write(f'{src_hash}|{src_fp}\n')
-                mark_done(src_fp)
-            hash_fh.flush()
-            progress_fh.flush()
-
-        # pending_batch: files staged but not yet confirmed uploaded.
-        # (source_path, md5) pairs — only written to DB after upload verified.
-        pending_batch = []
-
-        # ── Batch flush (Google Drive mode) ───────────────────────────────────
-        def flush_batch():
-            nonlocal batch_bytes, batches
-
-            # Count staged files
-            staged = []
-            for src_d in [stage_docs, stage_photos]:
-                for root, _, files in os.walk(src_d):
-                    staged.extend(os.path.join(root, f) for f in files)
-            if not staged:
-                return
-
-            batches += 1
-            gb = batch_bytes / (1024 ** 3)
-            batch_bytes = 0
-
-            if use_rclone:
-                # ── rclone copy then manual cleanup ───────────────────────────
-                # Using 'copy' (not 'move') so rclone never deletes local files.
-                # Concurrent workers in 'move' delete files as they finish, then
-                # retries hit "no such file" on already-deleted files — causing
-                # false failure exits. With 'copy' we delete staging ourselves
-                # only after a clean exit code.
-                dest_remote = f'{rclone_remote}:{gd_subfolder}'
-                log(f'\n  ── Flushing batch #{batches}  ({gb:.1f} GB, {len(staged)} files)'
-                    f' → {dest_remote}', 'gd')
-                try:
-                    proc = subprocess.Popen(
-                        [self._rclone_path, 'copy', stage_dir, dest_remote,
-                         '--no-traverse',
-                         '--transfers=8',
-                         '--checkers=16',
-                         '--buffer-size=64M',
-                         '--drive-chunk-size=128M',
-                         '-v',
-                         '--stats=10s',
-                         '--stats-one-line'],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True, bufsize=1,
-                    )
-                    # Stream rclone output live so progress is visible in the log
-                    for line in proc.stdout:
-                        line = line.rstrip()
-                        if line:
-                            log(f'  rclone: {line}', 'gd')
-                        if not self._running:
-                            proc.terminate()
-                            break
-                    proc.wait()
-                    returncode = proc.returncode
-
-                    if returncode != 0 and self._running:
-                        log(f'  ERR  rclone exited with code {returncode} — staged files kept for retry', 'err')
-                        # Leave pending_batch intact — not confirmed, not marked done
-                    elif self._running:
-                        # Upload confirmed — now safe to clean up staging locally
-                        shutil.rmtree(stage_dir, ignore_errors=True)
-                        os.makedirs(stage_docs,   exist_ok=True)
-                        os.makedirs(stage_photos,  exist_ok=True)
-                        log(f'  ── Batch #{batches} uploaded ✓  confirming {len(pending_batch)} files...', 'gd')
-                        confirm_batch(pending_batch)
-                        pending_batch.clear()
-                        log(f'  ── Confirmed. Resuming scan.\n', 'gd')
-                except Exception as e:
-                    log(f'  ERR  rclone exception: {e} — staged files kept for retry', 'err')
-
-            else:
-                # ── Legacy: move into ~/Library/CloudStorage/... ──────────────
-                pairs = []
-                for src_d, dst_d in [(stage_docs, gd_docs), (stage_photos, gd_photos)]:
-                    for root, _, files in os.walk(src_d):
-                        for f in files:
-                            pairs.append((os.path.join(root, f), dst_d))
-                log(f'\n  ── Flushing batch #{batches}  ({gb:.1f} GB, {len(pairs)} files) → Google Drive', 'gd')
-                confirmed = []
-                for src, dst_d in pairs:
-                    if not self._running:
-                        break
-                    if not os.path.exists(src):
-                        continue
-                    dest = build_dest_path(dst_d, os.path.basename(src), src)
-                    try:
-                        shutil.move(src, dest)
-                        log(f'  →GD  {os.path.basename(dest)}', 'gd')
-                        confirmed.append(src)
-                    except Exception as e:
-                        log(f'  ERR  move failed: {os.path.basename(src)} — {e}', 'err')
-                # Confirm only the files that actually moved
-                confirmed_set = set(confirmed)
-                confirmed_batch = [(fp, h) for fp, h in pending_batch if fp in confirmed_set]
-                confirm_batch(confirmed_batch)
-                pending_batch[:] = [(fp, h) for fp, h in pending_batch if fp not in confirmed_set]
-                log(f'  ── Batch #{batches} moved to Google Drive ✓', 'gd')
-
-                # Wait for GDrive to upload and free local space
-                if free_bytes() < MIN_FREE_GB * 1024 ** 3:
-                    log(f'  ── Disk below {MIN_FREE_GB} GB free — waiting for GDrive to upload...', 'gd')
-                    wait_for_space(MIN_FREE_GB, status_fn=self._set_status)
-                    log(f'  ── Space recovered, resuming.\n', 'gd')
-                else:
-                    log('', 'gd')
-
-        # ── Process a single file ─────────────────────────────────────────────
-        def process_file(filepath, dest_dir):
-            nonlocal copied, skipped_dupe, skipped_sys, skipped_resume, errors, batch_bytes
-
-            if not self._running:
-                return
-
-            # Resume fast-path: already handled in a previous run
-            if filepath in processed_paths:
-                skipped_resume += 1
-                return
-
-            if should_skip(filepath, source_path):
-                skipped_sys += 1
-                return
-
-            # Single-pass: stream to temp file in dest_dir while computing hash.
-            # This avoids reading the source file twice (hash then copy).
-            tmp_path = None
-            try:
-                h, tmp_path, fsize = copy_and_hash(filepath, dest_dir)
-            except Exception as e:
-                log(f'  ERR   {os.path.basename(filepath)}: {e}', 'err')
-                errors += 1
-                return  # not marked done — will retry on resume
-
-            if h in seen_hashes:
-                # Duplicate — discard the temp copy we just wrote
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
-                log(f'  SKIP  {os.path.basename(filepath)}'
-                    f'  ← dup of {os.path.basename(seen_hashes[h])}', 'skip')
-                skipped_dupe += 1
-                mark_done(filepath)
-                return
-
-            # New unique file — update in-memory dedup immediately,
-            # but defer hash DB write + mark_done until upload is confirmed.
-            seen_hashes[h] = filepath
-
-            dest = build_dest_path(dest_dir, os.path.basename(filepath), filepath)
-            try:
-                shutil.move(tmp_path, dest)
-                log(f'  OK    {os.path.basename(dest)}', 'ok')
-                copied += 1
-                if use_gdrive:
-                    # Pend confirmation until rclone verifies the upload
-                    pending_batch.append((filepath, h))
-                    batch_bytes += fsize
-                    if batch_bytes >= BATCH_LIMIT_BYTES:
-                        flush_batch()
-                else:
-                    # Local mode: file is in final dest now — safe to confirm
-                    hash_fh.write(f'{h}|{filepath}\n')
-                    mark_done(filepath)
-            except Exception as e:
-                log(f'  ERR   {os.path.basename(filepath)}: {e}', 'err')
-                errors += 1
-                try:
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-                except Exception:
-                    pass
-                # not marked done — will retry on resume
-
-        # ── Single-pass walk — documents and photos in one traversal ─────────
-        def walk_all():
-            log('── Scanning ────────────────────────────────────────────────', 'head')
-            self._set_status('> scanning drive...')
-            count = 0
-            for root, dirs, files in os.walk(source_path):
-                if not self._running:
-                    break
-                dirs[:] = sorted([
-                    d for d in dirs
-                    if not d.startswith('.') and d.lower() not in SKIP_DIRS
-                ])
-                for f in files:
-                    if not self._running:
-                        break
-                    ext = Path(f).suffix.lstrip('.').lower()
-                    if ext in DOCUMENT_EXTS:
-                        process_file(os.path.join(root, f), docs_dir)
-                        count += 1
-                    elif ext in IMAGE_EXTS:
-                        process_file(os.path.join(root, f), photos_dir)
-                        count += 1
-                    if count % 10 == 0 and count > 0:
-                        self._set_status(
-                            f'> {count:,} seen  |  {copied} copied  |  '
-                            f'{skipped_dupe} dupes  |  {skipped_resume} resumed  |  {errors} errors'
-                        )
-
-        # ── Header ────────────────────────────────────────────────────────────
-        if use_gdrive and use_rclone:
-            mode_label = f'Google Drive via rclone  ({BATCH_LIMIT_GB} GB batches → {rclone_remote}:{gd_subfolder})'
-        elif use_gdrive:
-            mode_label = f'Google Drive  ({BATCH_LIMIT_GB} GB batches, legacy mode)'
-        else:
-            mode_label = 'Local folder'
-        resume_label = f'RESUME  ({len(processed_paths):,} files already done)' if resume else 'NEW RUN'
-        log(f'Source : {source_path}', 'info')
-        log(f'Output : {output_path}', 'info')
-        log(f'Mode   : {mode_label}', 'info')
-        log(f'Session: {resume_label}', 'info')
-        log(f'Hashes : {len(seen_hashes):,} loaded from previous runs  (~/.shinigami_eyes/)', 'info')
-        log(f'Started: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n', 'info')
-
-        # ── rclone sanity check ───────────────────────────────────────────────
-        if use_rclone:
-            log('── Checking rclone connection ──────────────────────────────', 'head')
-            self._set_status('> verifying rclone auth...')
-            try:
-                result = subprocess.run(
-                    [self._rclone_path, 'about', f'{rclone_remote}:'],
-                    capture_output=True, text=True, timeout=60,
-                )
-                if result.returncode != 0:
-                    log(f'  ERR  rclone auth check failed:', 'err')
-                    log(f'  {result.stderr.strip()[:300]}', 'err')
-                    log('  Fix: run  rclone config reconnect gdrive:  then try again.', 'err')
-                    return
-                log(f'  rclone OK  — authenticated to {rclone_remote}:\n', 'ok')
-            except subprocess.TimeoutExpired:
-                log('  ERR  rclone timed out — check your network connection.', 'err')
-                return
-            except Exception as e:
-                log(f'  ERR  rclone check failed: {e}', 'err')
-                return
-
-        # ── Run ───────────────────────────────────────────────────────────────
-        walk_all()
-
-        if use_gdrive and self._running:
-            flush_batch()
-
-        # ── Close persistent files ────────────────────────────────────────────
-        try:
-            hash_fh.close()
-            progress_fh.close()
-        except Exception:
-            pass
-
-        # ── Summary ───────────────────────────────────────────────────────────
-        stopped_early = not self._running
-        status = '⚠  Stopped early' if stopped_early else '✓  Complete'
-
-        log('\n' + '─' * 52, 'head')
-        log(f'  {status}', 'head')
-        log(f'  Files copied         : {copied}', 'head')
-        log(f'  Duplicates skipped   : {skipped_dupe}', 'head')
-        log(f'  Resumed (skipped)    : {skipped_resume}', 'head')
-        log(f'  System/junk skipped  : {skipped_sys}', 'head')
-        log(f'  Errors               : {errors}', 'head')
-        if use_gdrive:
-            log(f'  Batches sent to GDrive: {batches}', 'head')
-        log(f'  Total hashes on file : {len(seen_hashes):,}', 'head')
-        log('─' * 52, 'head')
-        if stopped_early:
-            log('  Restart and choose RESUME to continue where this stopped.', 'info')
-
-        self._set_status(
-            f'> {status.lower()} — {copied} copied  |  {skipped_dupe} dupes  |  {errors} errors'
-        )
-
-        # Save session log
-        try:
-            with open(log_path, 'w') as lf:
-                lf.write('\n'.join(log_lines))
-        except Exception:
-            pass
-
-        # Clean up staging
-        if use_gdrive:
-            shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    app = MigrationApp()
+    app.mainloop()
+
 
 if __name__ == '__main__':
-    app = App()
-    app.mainloop()
+    main()

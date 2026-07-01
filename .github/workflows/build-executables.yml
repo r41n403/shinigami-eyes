@@ -1,0 +1,115 @@
+name: Build Executables (Windows + macOS)
+
+# Builds Shinigami Eyes into standalone executables for both platforms from
+# ONE shared source file (nas_migrate_gui.py) — it already has IS_MAC/
+# IS_WINDOWS guards throughout, so the same codebase runs correctly on both.
+#
+# Triggers:
+#   - Any push that touches the app source or this workflow file
+#   - Manual "Run workflow" button in the Actions tab (workflow_dispatch)
+#   - Pushing a version tag (v*.*.*) additionally publishes a GitHub Release
+#     with both builds attached as downloadable assets
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'nas_migrate_gui.py'
+      - '.github/workflows/build-executables.yml'
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            artifact_name: ShinigamiEyes-Windows
+            artifact_path: dist/Shinigami Eyes.exe
+          - os: macos-latest
+            platform: macos
+            artifact_name: ShinigamiEyes-macOS
+            artifact_path: dist/Shinigami Eyes.app
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python (Windows)
+        if: matrix.platform == 'windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # GitHub's hosted macOS Python (via actions/setup-python) is built
+      # WITHOUT tkinter support, which is a known long-standing gap — tkinter
+      # apps fail to even import there. Homebrew's python-tk formula installs
+      # a Framework Python that does include it, so we use that instead on
+      # macOS. `brew --prefix` (rather than a hardcoded /opt/homebrew or
+      # /usr/local) keeps this working whether the runner is Apple Silicon or
+      # Intel.
+      - name: Set up Python with tkinter (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew install python-tk@3.12
+          echo "$(brew --prefix python-tk@3.12)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix python@3.12)/bin" >> $GITHUB_PATH
+
+      - name: Install PyInstaller (Windows)
+        if: matrix.platform == 'windows'
+        run: pip install pyinstaller
+
+      - name: Install PyInstaller (macOS)
+        if: matrix.platform == 'macos'
+        run: pip3 install pyinstaller
+
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+
+      # No --onefile on macOS: PyInstaller + --windowed produces a proper
+      # Shinigami Eyes.app bundle (matches the existing double-click-to-launch
+      # distribution style), whereas --onefile would just give a raw
+      # executable with no Finder-friendly bundle.
+      - name: Build (macOS)
+        if: matrix.platform == 'macos'
+        run: pyinstaller --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          retention-days: 30
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package Windows exe
+        run: cp "artifacts/ShinigamiEyes-Windows/Shinigami Eyes.exe" "./Shinigami Eyes-Windows.exe"
+
+      - name: Zip macOS app bundle
+        run: |
+          cd "artifacts/ShinigamiEyes-macOS"
+          zip -r "../../Shinigami Eyes-macOS.zip" "Shinigami Eyes.app"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Shinigami Eyes-Windows.exe
+            Shinigami Eyes-macOS.zip
