@@ -46,7 +46,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       # GitHub's hosted macOS Python (via actions/setup-python) is built
       # WITHOUT tkinter support, which is a known long-standing gap — tkinter
