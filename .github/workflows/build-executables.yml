@@ -1,15 +1,5 @@
 name: Build Executables (Windows + macOS)
 
-# Builds Shinigami Eyes into standalone executables for both platforms from
-# ONE shared source file (nas_migrate_gui.py) — it already has IS_MAC/
-# IS_WINDOWS guards throughout, so the same codebase runs correctly on both.
-#
-# Triggers:
-#   - Any push that touches the app source or this workflow file
-#   - Manual "Run workflow" button in the Actions tab (workflow_dispatch)
-#   - Pushing a version tag (v*.*.*) additionally publishes a GitHub Release
-#     with both builds attached as downloadable assets
-
 on:
   push:
     branches: [main, master]
@@ -33,7 +23,7 @@ jobs:
           - os: macos-latest
             platform: macos
             artifact_name: ShinigamiEyes-macOS
-            artifact_path: dist/Shinigami Eyes.app
+            artifact_path: dist/Shinigami Eyes-macOS.zip
 
     runs-on: ${{ matrix.os }}
 
@@ -47,13 +37,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      # GitHub's hosted macOS Python (via actions/setup-python) is built
-      # WITHOUT tkinter support, which is a known long-standing gap — tkinter
-      # apps fail to even import there. Homebrew's python-tk formula installs
-      # a Framework Python that does include it, so we use that instead on
-      # macOS. `brew --prefix` (rather than a hardcoded /opt/homebrew or
-      # /usr/local) keeps this working whether the runner is Apple Silicon or
-      # Intel.
       - name: Set up Python with tkinter (macOS)
         if: matrix.platform == 'macos'
         run: |
@@ -73,13 +56,15 @@ jobs:
         if: matrix.platform == 'windows'
         run: pyinstaller --onefile --windowed --name "Shinigami Eyes" nas_migrate_gui.py
 
-      # No --onefile on macOS: PyInstaller + --windowed produces a proper
-      # Shinigami Eyes.app bundle (matches the existing double-click-to-launch
-      # distribution style), whereas --onefile would just give a raw
-      # executable with no Finder-friendly bundle.
       - name: Build (macOS)
         if: matrix.platform == 'macos'
         run: pyinstaller --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+
+      - name: Zip macOS app bundle
+        if: matrix.platform == 'macos'
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "Shinigami Eyes.app" "Shinigami Eyes-macOS.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -101,10 +86,8 @@ jobs:
       - name: Package Windows exe
         run: cp "artifacts/ShinigamiEyes-Windows/Shinigami Eyes.exe" "./Shinigami Eyes-Windows.exe"
 
-      - name: Zip macOS app bundle
-        run: |
-          cd "artifacts/ShinigamiEyes-macOS"
-          zip -r "../../Shinigami Eyes-macOS.zip" "Shinigami Eyes.app"
+      - name: Package macOS zip
+        run: cp "artifacts/ShinigamiEyes-macOS/Shinigami Eyes-macOS.zip" "./Shinigami Eyes-macOS.zip"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
