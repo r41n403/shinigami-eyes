@@ -67,7 +67,7 @@ jobs:
 
       - name: Install PyInstaller (macOS)
         if: matrix.platform == 'macos'
-        run: pip3 install pyinstaller
+        run: pip3 install --break-system-packages pyinstaller
 
       - name: Build (Windows)
         if: matrix.platform == 'windows'
