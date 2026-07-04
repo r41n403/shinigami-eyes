@@ -254,5 +254,74 @@ class TestArtifactNameConsistency(unittest.TestCase):
                           'not every matrix artifact_name is referenced in the release job')
 
 
+class TestCodeSigning(unittest.TestCase):
+    """Covers the macOS codesign/notarize/staple pipeline added on top of
+    the plain builds. Windows is intentionally left unsigned for now — no
+    Azure/CA setup wired in yet — so there's nothing Windows-signing-specific
+    to assert here."""
+
+    def setUp(self):
+        self.data  = load_workflow()
+        self.build = self.data['jobs']['build']
+        self.steps = self.build['steps']
+
+    def _step(self, name_substr: str):
+        for s in self.steps:
+            if name_substr.lower() in s.get('name', '').lower():
+                return s
+        return None
+
+    def test_windows_build_has_no_signing_steps(self):
+        # Documents the current state on purpose: Windows builds are
+        # unsigned, so there should be no Azure/signtool step present.
+        names = [s.get('name', '') for s in self.steps]
+        self.assertFalse(any('sign windows' in n.lower() for n in names))
+        self.assertFalse(any('azure' in n.lower() for n in names))
+
+    def test_macos_signing_pipeline_present_in_order(self):
+        """The signing/notarizing/stapling steps must run in this exact
+        order relative to the build and the final zip — e.g. stapling has to
+        happen before the distributable zip is made, or the shipped app
+        never actually gets its notarization ticket attached."""
+        names = [s.get('name', '') for s in self.steps]
+        required_order = [
+            'Build (macOS)',
+            'Import Developer ID certificate',
+            'Code sign app bundle',
+            'Notarize app',
+            'Zip macOS app bundle',
+        ]
+        for n in required_order:
+            self.assertIn(n, names, f'missing step: {n}')
+        indices = [names.index(n) for n in required_order]
+        self.assertEqual(indices, sorted(indices),
+                          'macOS sign/notarize steps are out of order: ' + str(names))
+
+    def test_macos_signing_steps_are_macos_only(self):
+        for name in ('Import Developer ID certificate', 'Code sign app bundle', 'Notarize app'):
+            step = self._step(name)
+            self.assertIsNotNone(step, f'missing step: {name}')
+            self.assertIn("'macos'", step.get('if', ''))
+
+    def test_codesign_uses_hardened_runtime_and_entitlements(self):
+        step = self._step('Code sign app bundle')
+        self.assertIn('--options runtime', step['run'])
+        self.assertIn('entitlements.plist', step['run'])
+
+    def test_codesign_verifies_after_signing(self):
+        step = self._step('Code sign app bundle')
+        self.assertIn('codesign --verify', step['run'])
+
+    def test_notarize_waits_and_staples(self):
+        step = self._step('Notarize app')
+        self.assertIn('notarytool submit', step['run'])
+        self.assertIn('--wait', step['run'])
+        self.assertIn('stapler staple', step['run'])
+
+    def test_entitlements_file_exists(self):
+        self.assertTrue((REPO_ROOT / 'entitlements.plist').exists(),
+                         'entitlements.plist referenced by the codesign step but not in the repo')
+
+
 if __name__ == '__main__':
     unittest.main()

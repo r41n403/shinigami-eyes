@@ -57,6 +57,9 @@ jobs:
       # resource_path() (which checks sys._MEIPASS at runtime) can find it.
       # The SRC/DEST separator is platform-specific: ';' on Windows, ':'
       # everywhere else, because ':' collides with Windows drive letters.
+      # Not code-signed for now — the .exe will trigger a Windows SmartScreen
+      # "Unknown Publisher" warning until a signing option (Azure Artifact
+      # Signing, a purchased cert, or SignPath Foundation) is wired back in.
       - name: Build (Windows)
         if: matrix.platform == 'windows'
         run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
@@ -64,6 +67,59 @@ jobs:
       - name: Build (macOS)
         if: matrix.platform == 'macos'
         run: pyinstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
+
+      # Imports the Developer ID Application certificate into a throwaway
+      # keychain that only exists for this job — the runner VM is destroyed
+      # after the job finishes, so a fixed keychain password is fine here.
+      - name: Import Developer ID certificate
+        if: matrix.platform == 'macos'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm certificate.p12
+
+      # --options runtime enables the hardened runtime, required for
+      # notarization. --deep re-signs every nested binary PyInstaller
+      # bundled (Python framework, dylibs, etc.), not just the top-level app.
+      - name: Code sign app bundle
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --deep --force --verbose --timestamp \
+            --options runtime \
+            --entitlements entitlements.plist \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "dist/Shinigami Eyes.app"
+          codesign --verify --deep --strict --verbose=2 "dist/Shinigami Eyes.app"
+
+      # Apple only notarizes zip/dmg/pkg submissions, not a raw .app — so this
+      # zip is just for the upload, separate from the final distributable zip
+      # below (which is built from the .app *after* stapling).
+      - name: Notarize app
+        if: matrix.platform == 'macos'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "Shinigami Eyes.app" "notarize-submission.zip"
+          xcrun notarytool submit "notarize-submission.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "Shinigami Eyes.app"
+          rm notarize-submission.zip
 
       - name: Zip macOS app bundle
         if: matrix.platform == 'macos'
