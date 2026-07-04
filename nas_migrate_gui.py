@@ -58,16 +58,31 @@ HASH_DB_FILE   = STATE_DIR / 'hashes.db'
 B2_CONFIG_FILE  = STATE_DIR / 'b2_config.json'
 APP_CONFIG_FILE = STATE_DIR / 'config.json'
 
+
+def resource_path(filename: str) -> str:
+    """Resolve a bundled asset (e.g. the logo PNG) whether running from
+    source or from a PyInstaller-frozen executable. PyInstaller unpacks
+    --add-data files next to the script inside a temp dir exposed as
+    sys._MEIPASS at runtime; when running from source, they just sit next
+    to this .py file."""
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+    return str(base / filename)
+
+
+LOGO_FILE = resource_path('shinigami_eyes_logo.png')
+
 # ── Colours (Matrix theme) ────────────────────────────────────────────────────
-BG      = '#030b03'
-FG      = '#00ff41'
-SURFACE = '#0a160a'
+BG      = '#000000'
+FG      = '#b740a8'
+SURFACE = '#2c2a26'
 BORDER  = '#1a4d1a'
-GREEN   = '#00ff41'
+GREEN   = '#ffc23c'
+BTN_BG  = '#00ff41'  # kept for the two green action-button backgrounds (not text)
 YELLOW  = '#ffe100'
-RED     = '#ff2222'
+RED     = '#ac9ae5'
 MUTED   = '#2d7a2d'
 TEAL    = '#00e5cc'
+WHITE   = '#ffffff'
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JUNK-FILE FILTER
@@ -1484,7 +1499,7 @@ class VolumePicker(tk.Toplevel):
                 except Exception:
                     hint = ''
                 if hint:
-                    tk.Label(frame, text=hint, font=(MONO_FONT, 9), fg=MUTED, bg=BG,
+                    tk.Label(frame, text=hint, font=(MONO_FONT, 9), fg=GREEN, bg=BG,
                              anchor='w').pack(fill='x', padx=(20, 0))
                 self._vars.append((var, v))
 
@@ -1492,7 +1507,7 @@ class VolumePicker(tk.Toplevel):
         btn_row.pack(pady=16)
         tk.Button(btn_row, text='Add Selected',
                   font=(MONO_FONT, 11, 'bold'),
-                  bg=GREEN, fg='#000', activebackground='#00cc33',
+                  bg=GREEN, fg='#000', activebackground='#d8a533',
                   relief='flat', padx=14, pady=6,
                   command=self._ok).pack(side='left', padx=8)
         tk.Button(btn_row, text='Browse…',
@@ -1500,7 +1515,7 @@ class VolumePicker(tk.Toplevel):
                   relief='flat', padx=14, pady=6,
                   command=self._browse).pack(side='left', padx=8)
         tk.Button(btn_row, text='Cancel',
-                  font=(MONO_FONT, 11), bg=SURFACE, fg=MUTED,
+                  font=(MONO_FONT, 11), bg=SURFACE, fg=GREEN,
                   relief='flat', padx=14, pady=6,
                   command=self.destroy).pack(side='left', padx=8)
 
@@ -1523,7 +1538,7 @@ class DriveRow(tk.Frame):
     """One row in the drive list for a single source drive."""
 
     STATUS_COLORS = {
-        'queued':    MUTED,
+        'queued':    WHITE,
         'running':   GREEN,
         'uploading': YELLOW,
         'done':      GREEN,
@@ -1540,17 +1555,28 @@ class DriveRow(tk.Frame):
     }
 
     def __init__(self, parent, info: DriveInfo, on_remove: Callable, **kwargs):
-        super().__init__(parent, bg=SURFACE, relief='flat',
-                         highlightbackground=BORDER, highlightthickness=1, **kwargs)
+        # Native Tk has no blur, so the "glow" is faked with concentric
+        # frames — each a solid ring stepping from a faint outer violet up
+        # through a brighter mid tone into the crisp white edge of the
+        # actual content box, approximating a soft bloom around the row.
+        super().__init__(parent, bg='#1a0620', **kwargs)
+        glow_mid = tk.Frame(self, bg='#4a1450')
+        glow_mid.pack(fill='both', expand=True, padx=3, pady=3)
+        glow_hot = tk.Frame(glow_mid, bg=FG)
+        glow_hot.pack(fill='both', expand=True, padx=2, pady=2)
+        content = tk.Frame(glow_hot, bg=SURFACE, relief='flat',
+                           highlightbackground=WHITE, highlightthickness=1)
+        content.pack(fill='both', expand=True, padx=1, pady=1)
+
         self.info   = info
         self.stats  = DriveStats(label=info.label_or_name)
 
         # ── Header row ────────────────────────────────────────────────────────
-        hdr = tk.Frame(self, bg=SURFACE)
+        hdr = tk.Frame(content, bg=SURFACE)
         hdr.pack(fill='x', padx=10, pady=(8, 2))
 
         self._icon_lbl = tk.Label(hdr, text='○', font=(MONO_FONT, 14, 'bold'),
-                                  fg=MUTED, bg=SURFACE, width=2)
+                                  fg=WHITE, bg=SURFACE, width=2)
         self._icon_lbl.pack(side='left')
 
         self._title_lbl = tk.Label(hdr,
@@ -1559,19 +1585,19 @@ class DriveRow(tk.Frame):
         self._title_lbl.pack(side='left', padx=(4, 0))
 
         tk.Button(hdr, text='×', font=(MONO_FONT, 13, 'bold'),
-                  fg=MUTED, bg=SURFACE, activeforeground=RED,
+                  fg=GREEN, bg=SURFACE, activeforeground=RED,
                   relief='flat', cursor='hand2', padx=4,
                   command=on_remove).pack(side='right')
 
         # ── Detail row ────────────────────────────────────────────────────────
-        self._detail_lbl = tk.Label(self, text=info.detail_str,
-                                    font=(MONO_FONT, 9), fg=MUTED, bg=SURFACE,
+        self._detail_lbl = tk.Label(content, text=info.detail_str,
+                                    font=(MONO_FONT, 9), fg=WHITE, bg=SURFACE,
                                     anchor='w')
         self._detail_lbl.pack(fill='x', padx=28, pady=(0, 2))
 
         # ── Stats row ─────────────────────────────────────────────────────────
-        self._stats_lbl = tk.Label(self, text='Waiting to start…',
-                                   font=(MONO_FONT, 9), fg=MUTED, bg=SURFACE,
+        self._stats_lbl = tk.Label(content, text='Waiting to start…',
+                                   font=(MONO_FONT, 9), fg=WHITE, bg=SURFACE,
                                    anchor='w')
         self._stats_lbl.pack(fill='x', padx=28, pady=(0, 8))
 
@@ -1606,7 +1632,7 @@ class DriveRow(tk.Frame):
                    f'{_fmt_bytes(stats.bytes_copied)}')
             self._stats_lbl.config(text=msg, fg=color)
         else:
-            self._stats_lbl.config(text=stats.status.capitalize() + '…', fg=MUTED)
+            self._stats_lbl.config(text=stats.status.capitalize() + '…', fg=WHITE)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1644,14 +1670,23 @@ class MigrationApp(tk.Tk):
         outer = tk.Frame(self, bg=BG, padx=24, pady=16)
         outer.pack(fill='both', expand=True)
 
-        # Title
-        tk.Label(outer, text='SHINIGAMI EYES',
-                 font=(MONO_FONT, 18, 'bold'), fg=GREEN, bg=BG).pack(anchor='w')
+        # Title — stylised logo image, falling back to plain text if the
+        # asset is missing or this Tk build can't load PNGs.
+        try:
+            self._logo_img = tk.PhotoImage(file=LOGO_FILE)
+            target_w = 460   # PhotoImage only supports integer subsample factors
+            if self._logo_img.width() > target_w:
+                factor = max(1, self._logo_img.width() // target_w)
+                self._logo_img = self._logo_img.subsample(factor, factor)
+            tk.Label(outer, image=self._logo_img, bg=BG).pack(anchor='w')
+        except Exception:
+            tk.Label(outer, text='SHINIGAMI EYES',
+                     font=(MONO_FONT, 18, 'bold'), fg=WHITE, bg=BG).pack(anchor='w')
         tk.Label(outer, text='multi-drive NAS migration tool',
-                 font=(MONO_FONT, 10), fg=MUTED, bg=BG).pack(anchor='w', pady=(0, 14))
+                 font=(MONO_FONT, 10), fg=FG, bg=BG).pack(anchor='w', pady=(0, 14))
 
         # ── Drive list ────────────────────────────────────────────────────────
-        self._lbl(outer, 'SOURCE DRIVES').pack(anchor='w')
+        self._lbl(outer, 'SOURCE DRIVES', color=GREEN).pack(anchor='w')
 
         drive_container = tk.Frame(outer, bg=BG)
         drive_container.pack(fill='x', pady=(4, 0))
@@ -1691,22 +1726,22 @@ class MigrationApp(tk.Tk):
         tk.Button(add_row, text='＋  Add Drives',
                   font=(MONO_FONT, 11, 'bold'),
                   bg=SURFACE, fg=GREEN,
-                  activebackground=BORDER, activeforeground=GREEN,
+                  activebackground='#938f87', activeforeground=GREEN,
                   relief='flat', padx=14, pady=6, cursor='hand2',
                   command=self._add_drives).pack(side='left')
 
         # Max parallel
         tk.Label(add_row, text='Max parallel:',
-                 font=(MONO_FONT, 10), fg=MUTED, bg=BG).pack(side='left', padx=(20, 4))
+                 font=(MONO_FONT, 10), fg=GREEN, bg=BG).pack(side='left', padx=(20, 4))
         self.var_workers = tk.IntVar(value=DEFAULT_WORKERS)
         ttk.Spinbox(add_row, from_=1, to=8, width=4,
                     textvariable=self.var_workers,
                     font=(MONO_FONT, 10)).pack(side='left')
 
-        ttk.Separator(outer, orient='horizontal').pack(fill='x', pady=8)
+        self._stitch_sep(outer).pack(fill='x', pady=8)
 
         # ── Destination ───────────────────────────────────────────────────────
-        self._lbl(outer, 'DESTINATION').pack(anchor='w')
+        self._lbl(outer, 'DESTINATION', color=GREEN).pack(anchor='w')
         self.var_mode = tk.StringVar(value='local')
         mode_row = tk.Frame(outer, bg=BG)
         mode_row.pack(fill='x', pady=(4, 0))
@@ -1723,7 +1758,7 @@ class MigrationApp(tk.Tk):
         # Local panel
         self.panel_local = tk.Frame(outer, bg=BG)
         self.panel_local.pack(fill='x', pady=(8, 4))
-        self._lbl(self.panel_local, 'Output folder').pack(anchor='w')
+        self._lbl(self.panel_local, 'Output folder', color=GREEN).pack(anchor='w')
         loc_row = tk.Frame(self.panel_local, bg=BG)
         loc_row.pack(fill='x', pady=(4, 0))
         self.var_output = tk.StringVar()
@@ -1775,30 +1810,30 @@ class MigrationApp(tk.Tk):
         _b2_row('Subfolder', self.var_b2_subfolder)
         tk.Label(self.panel_b2,
                  text=f'Files staged in {BATCH_LIMIT_GB} GB batches, uploaded via rclone.',
-                 font=(MONO_FONT, 9), fg=MUTED, bg=BG).pack(anchor='w', pady=(8, 4))
+                 font=(MONO_FONT, 9), fg=GREEN, bg=BG).pack(anchor='w', pady=(8, 4))
 
         self._refresh_rclone_status()
 
-        ttk.Separator(outer, orient='horizontal').pack(fill='x', pady=8)
+        self._stitch_sep(outer).pack(fill='x', pady=8)
 
         # ── ntfy ──────────────────────────────────────────────────────────────
         ntfy_row = tk.Frame(outer, bg=BG)
         ntfy_row.pack(fill='x', pady=(0, 10))
         self._ntfy_row = ntfy_row
-        self._lbl(ntfy_row, 'ntfy topic').pack(side='left')
-        tk.Label(ntfy_row, text='(optional)', font=(MONO_FONT, 9), fg=MUTED, bg=BG).pack(side='left', padx=6)
+        self._lbl(ntfy_row, 'ntfy topic', color=GREEN).pack(side='left')
+        tk.Label(ntfy_row, text='(optional)', font=(MONO_FONT, 9), fg=GREEN, bg=BG).pack(side='left', padx=6)
         _cfg = load_app_config()
         self.var_ntfy = tk.StringVar(value=_cfg.get('ntfy_topic', ''))
         self._entry(ntfy_row, self.var_ntfy, width=30).pack(side='left', padx=(10, 0))
 
-        ttk.Separator(outer).pack(fill='x', pady=4)
+        self._stitch_sep(outer).pack(fill='x', pady=4)
 
         # ── Buttons ───────────────────────────────────────────────────────────
         btn_row = tk.Frame(outer, bg=BG, pady=10)
         btn_row.pack()
         self.btn_start = tk.Button(btn_row, text='▶  EXECUTE',
             font=(MONO_FONT, 13, 'bold'), bg=GREEN, fg='#000',
-            activebackground='#00cc33', activeforeground='#000',
+            activebackground='#d8a533', activeforeground='#000',
             relief='flat', padx=22, pady=9, cursor='hand2',
             command=self._start)
         self.btn_start.pack(side='left', padx=(0, 12))
@@ -1812,7 +1847,7 @@ class MigrationApp(tk.Tk):
         # ── Status + log ──────────────────────────────────────────────────────
         self.var_status = tk.StringVar(value='Ready')
         tk.Label(outer, textvariable=self.var_status,
-                 font=(MONO_FONT, 10), fg=TEAL, bg=BG, anchor='w').pack(fill='x', pady=(8, 2))
+                 font=(MONO_FONT, 10), fg='#ffffff', bg=BG, anchor='w').pack(fill='x', pady=(8, 2))
 
         self.log_box = tk.Text(outer, height=14, bg=SURFACE, fg=FG,
                                font=(MONO_FONT, 10), relief='flat',
@@ -1823,19 +1858,45 @@ class MigrationApp(tk.Tk):
 
         # Log tags
         for tag, color in [('ok', GREEN), ('err', RED), ('warn', YELLOW),
-                            ('gd', TEAL), ('head', TEAL), ('info', FG)]:
+                            ('gd', TEAL), ('head', TEAL), ('info', FG),
+                            ('gdload', WHITE)]:
             self.log_box.tag_config(tag, foreground=color)
 
         self._on_mode()
 
-    def _lbl(self, parent, text):
+    def _lbl(self, parent, text, color=MUTED):
         return tk.Label(parent, text=text, font=(MONO_FONT, 9, 'bold'),
-                        fg=MUTED, bg=BG)
+                        fg=color, bg=BG)
 
     def _entry(self, parent, var, width=40, **kw):
         return tk.Entry(parent, textvariable=var, width=width,
                         bg=SURFACE, fg=FG, insertbackground=GREEN,
                         relief='flat', font=(MONO_FONT, 10), **kw)
+
+    def _stitch_sep(self, parent, height=15, color=WHITE, bg=BG):
+        """Horizontal 'stitched scar' divider — a dashed thread run through
+        with rectangular cross-stitches, replacing the plain ttk.Separator
+        line. Redraws itself to fill whatever width it's packed into."""
+        canvas = tk.Canvas(parent, height=height, bg=bg, highlightthickness=0)
+        mid = height // 2
+        spacing = 14
+        half = 3
+        rect_w = 1
+
+        def _draw(event=None):
+            canvas.delete('all')
+            w = canvas.winfo_width()
+            if w <= 1:
+                return
+            canvas.create_line(0, mid, w, mid, fill=color, width=1, dash=(2, 3))
+            x = spacing // 2
+            while x < w:
+                canvas.create_rectangle(x - rect_w, mid - half, x + rect_w, mid + half,
+                                        fill=color, outline=color)
+                x += spacing
+
+        canvas.bind('<Configure>', _draw)
+        return canvas
 
     def _on_mode(self):
         mode = self.var_mode.get()
@@ -1896,7 +1957,7 @@ class MigrationApp(tk.Tk):
         self.wait_window(picker)
         for path in picker.selected:
             if path and path not in already:
-                self._log(f'  Loading info for {os.path.basename(path)}…', 'gd')
+                self._log(f'  Loading info for {os.path.basename(path)}…', 'gdload')
                 threading.Thread(target=self._add_drive_bg, args=(path,),
                                  daemon=True).start()
 
