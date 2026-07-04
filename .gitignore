@@ -8,6 +8,11 @@ __pycache__/
 *.pyc
 *.pyo
 
+# PyInstaller build output — CI/Releases produce these, don't commit local builds
+build/
+dist/
+*.app/
+
 # Logs
 migration_log_*.txt
 

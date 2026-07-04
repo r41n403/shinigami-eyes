@@ -1,4 +1,6 @@
-# Shinigami Eyes
+<p align="center">
+  <img src="shinigami_eyes_logo.png" alt="Shinigami Eyes" width="480">
+</p>
 
 ### Multi-Drive File Migration System
 *developed by r41n403*
@@ -73,10 +75,10 @@ Neither build is code-signed, so first launch will trigger a one-time warning:
 ```powershell
 python nas_migrate_gui.py
 ```
-Or build a standalone `.exe`:
+Or build a standalone `.exe` (the `--add-data` flag bundles the logo so the built exe shows it too):
 ```powershell
 pip install pyinstaller
-pyinstaller --onefile --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+pyinstaller --onefile --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
 ```
 The executable lands in `dist\Shinigami Eyes.exe`.
 
@@ -87,9 +89,16 @@ python3 nas_migrate_gui.py
 Or build a standalone `.app`:
 ```bash
 pip3 install pyinstaller
-pyinstaller --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+pyinstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
 ```
-The bundle lands in `dist/Shinigami Eyes.app`.
+The bundle lands in `dist/Shinigami Eyes.app`. (On a Homebrew Python install, `pip3 install` may need `--break-system-packages`.)
+
+### Or use the provided `.spec` file
+
+`Shinigami Eyes.spec` already has the logo wired into `datas=[]`, so a plain PyInstaller invocation works on either platform without typing out `--add-data`:
+```bash
+pyinstaller "Shinigami Eyes.spec"
+```
 
 ### Configuring rclone (Google Drive)
 
@@ -231,9 +240,22 @@ Both prebuilt binaries are unsigned. Windows: "More info" → "Run anyway". macO
 [`.github/workflows/build-executables.yml`](.github/workflows/build-executables.yml) builds both platforms from the single `nas_migrate_gui.py` on every push to `main`:
 
 - **Windows** — `actions/setup-python` + PyInstaller → `Shinigami Eyes.exe`
-- **macOS** — Homebrew's `python-tk` (GitHub's hosted macOS Python doesn't include tkinter) + PyInstaller → `Shinigami Eyes.app`
+- **macOS** — Homebrew's `python-tk` (GitHub's hosted macOS Python doesn't include tkinter) + PyInstaller → `Shinigami Eyes.app` (zipped via `ditto`)
+- Both builds bundle `shinigami_eyes_logo.png` via `--add-data` so the frozen executable shows the same logo as running from source
+- Trigger paths cover `nas_migrate_gui.py`, `shinigami_eyes_logo.png`, and the workflow file itself — a logo-only change rebuilds too
 
-Pushing a version tag (`git tag v2.2.0 && git push --tags`) additionally publishes a GitHub Release with both builds attached as downloadable assets.
+Pushing a version tag (`git tag v2.2.0 && git push --tags`) additionally publishes a GitHub Release (requires `contents: write`, already configured) with both builds attached as downloadable assets.
+
+---
+
+## Testing
+
+[`tests/test_build_workflow.py`](tests/test_build_workflow.py) is a unit test suite for the CI workflow itself — it parses `build-executables.yml` and checks things a hand-edited YAML file can easily get wrong: matrix/artifact-name consistency, the platform-specific `--add-data` separator (`;` on Windows, `:` elsewhere), `--onefile` only being set on Windows, and the release job's file list actually matching what the package steps produce.
+
+```bash
+pip install -r tests/requirements.txt
+python3 -m unittest discover -s tests
+```
 
 ---
 
@@ -242,5 +264,7 @@ Pushing a version tag (`git tag v2.2.0 && git push --tags`) additionally publish
 | File | Description |
 |------|-------------|
 | `nas_migrate_gui.py` | Main application — Python/tkinter GUI, runs on both Mac and Windows |
-| `.github/workflows/build-executables.yml` | CI: builds Windows `.exe` and macOS `.app` on every push |
-| `nas_migrate.sh` | Legacy bash CLI — macOS only, single drive, no B2/multi-machine support |
+| `shinigami_eyes_logo.png` | App logo/wordmark, shown in the running app and bundled into both builds via PyInstaller `--add-data` |
+| `Shinigami Eyes.spec` | PyInstaller build spec with the logo already wired into `datas=[]` — alternative to the CLI flags above |
+| `.github/workflows/build-executables.yml` | CI: builds Windows `.exe` and macOS `.app` on every push, publishes releases on version tags |
+| `tests/` | Unit tests validating the CI workflow's structure (see [Testing](#testing)) |
