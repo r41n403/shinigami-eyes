@@ -5,6 +5,7 @@ on:
     branches: [main, master]
     paths:
       - 'nas_migrate_gui.py'
+      - 'shinigami_eyes_logo.png'
       - '.github/workflows/build-executables.yml'
     tags:
       - 'v*.*.*'
@@ -52,13 +53,17 @@ jobs:
         if: matrix.platform == 'macos'
         run: pip3 install --break-system-packages pyinstaller
 
+      # --add-data bundles the logo PNG next to the frozen executable so
+      # resource_path() (which checks sys._MEIPASS at runtime) can find it.
+      # The SRC/DEST separator is platform-specific: ';' on Windows, ':'
+      # everywhere else, because ':' collides with Windows drive letters.
       - name: Build (Windows)
         if: matrix.platform == 'windows'
-        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
 
       - name: Build (macOS)
         if: matrix.platform == 'macos'
-        run: pyinstaller --windowed --name "Shinigami Eyes" nas_migrate_gui.py
+        run: pyinstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
 
       - name: Zip macOS app bundle
         if: matrix.platform == 'macos'
