@@ -12,7 +12,7 @@
 ![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
 ![rclone](https://img.shields.io/badge/rclone-Google%20Drive%20%7C%20B2-3B3B3B?logo=rclone&logoColor=white)
 
-A desktop app for migrating files from flash drives and external storage to a local folder, Google Drive, or Backblaze B2 — **on Mac or Windows, from one shared codebase.** Runs up to 54 drives in parallel, deduplicates by MD5 hash across all drives *and* machines, resumes safely after interruptions, and uploads to cloud destinations in batches via rclone.
+A desktop app for migrating files from flash drives and external storage to a local folder, Google Drive, or Backblaze B2 — **on Mac or Windows, from one shared codebase.** Processes multiple drives in parallel with a configurable concurrency limit, deduplicates by MD5 hash across all drives *and* machines, resumes safely after interruptions, and uploads to cloud destinations in batches via rclone.
 
 ---
 
@@ -49,13 +49,21 @@ Both the Windows `.exe` and the macOS `.app` are built automatically from the **
 
 ---
 
+## Install
+
+The easiest way to get Shinigami Eyes — no Python, no source, no build step:
+
+1. Go to the [Releases page](https://github.com/r41n403/shinigami-eyes/releases/latest).
+2. Download the asset for your platform:
+   - **Windows:** `Shinigami Eyes-Windows.exe`
+   - **macOS:** `Shinigami Eyes-macOS.zip` (unzip it, then drag `Shinigami Eyes.app` wherever you like — Applications, Desktop, etc.)
+3. Run it. Both builds are code-signed and notarized (Windows via Azure Artifact Signing, macOS via a Developer ID certificate + Apple notarization), so there's no SmartScreen or Gatekeeper warning to click through.
+
+That's it — no dependencies to install for end users. Python, PyInstaller, and rclone are only needed if you're running from source (see [Setup from source](#setup-from-source) below).
+
 ## Download prebuilt builds
 
 Every push to `main` builds fresh Windows and macOS executables via GitHub Actions from the same source — see the [Actions tab](https://github.com/r41n403/shinigami-eyes/actions/workflows/build-executables.yml) for the latest run, or the [Releases page](https://github.com/r41n403/shinigami-eyes/releases) for tagged versions (`v*.*.*`) with both builds attached.
-
-Neither build is code-signed, so first launch will trigger a one-time warning:
-- **Windows:** SmartScreen — click "More info" → "Run anyway"
-- **macOS:** Gatekeeper — right-click the app → "Open" (only needed the first time)
 
 ---
 
@@ -230,17 +238,14 @@ Accept all permission prompts. The app waits up to ~12 seconds for a volume to r
 **Windows: drive metadata shows "?" for manufacturer/serial**
 Pulled via PowerShell's `Get-PhysicalDisk`/`Get-Disk`, which requires the drive to be exposed as a normal physical disk — some USB card readers and RAID enclosures don't report this. Doesn't affect migration, only the informational display.
 
-**Windows: SmartScreen / macOS: Gatekeeper warnings**
-Both prebuilt binaries are unsigned. Windows: "More info" → "Run anyway". macOS: right-click the app → "Open".
-
 ---
 
 ## CI / Building both platforms
 
 [`.github/workflows/build-executables.yml`](.github/workflows/build-executables.yml) builds both platforms from the single `nas_migrate_gui.py` on every push to `main`:
 
-- **Windows** — `actions/setup-python` + PyInstaller → `Shinigami Eyes.exe`
-- **macOS** — Homebrew's `python-tk` (GitHub's hosted macOS Python doesn't include tkinter) + PyInstaller → `Shinigami Eyes.app` (zipped via `ditto`)
+- **Windows** — `actions/setup-python` + PyInstaller → `Shinigami Eyes.exe`, then signed via **Azure Artifact Signing** (OIDC login, no stored secret)
+- **macOS** — Homebrew's `python-tk` (GitHub's hosted macOS Python doesn't include tkinter) + PyInstaller → `Shinigami Eyes.app`, then signed with a **Developer ID Application** certificate, notarized via `notarytool`, and stapled, before being zipped via `ditto`
 - Both builds bundle `shinigami_eyes_logo.png` via `--add-data` so the frozen executable shows the same logo as running from source
 - Trigger paths cover `nas_migrate_gui.py`, `shinigami_eyes_logo.png`, and the workflow file itself — a logo-only change rebuilds too
 
