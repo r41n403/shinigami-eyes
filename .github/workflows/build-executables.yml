@@ -13,6 +13,19 @@ on:
 
 jobs:
   build:
+    # id-token: write is required for the Windows leg's OIDC login to Azure
+    # (Azure Artifact Signing). contents: read must be listed explicitly too —
+    # once any permission is set, GitHub stops granting the defaults.
+    permissions:
+      id-token: write
+      contents: read
+    # Pinning the OIDC subject to a GitHub Environment (rather than a branch
+    # or tag ref) keeps it stable across every trigger this workflow has —
+    # branch pushes, tag pushes, and workflow_dispatch all produce the same
+    # subject (repo:OWNER/REPO:environment:production), so one Entra
+    # federated credential covers all of them. A per-ref credential would
+    # only match one exact branch or tag name.
+    environment: production
     strategy:
       fail-fast: false
       matrix:
@@ -57,12 +70,33 @@ jobs:
       # resource_path() (which checks sys._MEIPASS at runtime) can find it.
       # The SRC/DEST separator is platform-specific: ';' on Windows, ':'
       # everywhere else, because ':' collides with Windows drive letters.
-      # Not code-signed for now — the .exe will trigger a Windows SmartScreen
-      # "Unknown Publisher" warning until a signing option (Azure Artifact
-      # Signing, a purchased cert, or SignPath Foundation) is wired back in.
       - name: Build (Windows)
         if: matrix.platform == 'windows'
         run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
+
+      # Code-signs dist\Shinigami Eyes.exe via Azure Artifact Signing (formerly
+      # Trusted Signing). Requires a one-time Azure setup (signing account +
+      # certificate profile + an App Registration with a federated credential
+      # for OIDC) — see the repo README for the full checklist.
+      - name: Azure login (Windows signing)
+        if: matrix.platform == 'windows'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows exe with Azure Artifact Signing
+        if: matrix.platform == 'windows'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files: ${{ github.workspace }}\dist\Shinigami Eyes.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: Build (macOS)
         if: matrix.platform == 'macos'

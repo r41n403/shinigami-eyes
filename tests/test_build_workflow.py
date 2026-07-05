@@ -255,10 +255,8 @@ class TestArtifactNameConsistency(unittest.TestCase):
 
 
 class TestCodeSigning(unittest.TestCase):
-    """Covers the macOS codesign/notarize/staple pipeline added on top of
-    the plain builds. Windows is intentionally left unsigned for now — no
-    Azure/CA setup wired in yet — so there's nothing Windows-signing-specific
-    to assert here."""
+    """Covers the Windows Azure Artifact Signing steps and the macOS
+    codesign/notarize/staple pipeline added on top of the plain builds."""
 
     def setUp(self):
         self.data  = load_workflow()
@@ -271,12 +269,34 @@ class TestCodeSigning(unittest.TestCase):
                 return s
         return None
 
-    def test_windows_build_has_no_signing_steps(self):
-        # Documents the current state on purpose: Windows builds are
-        # unsigned, so there should be no Azure/signtool step present.
-        names = [s.get('name', '') for s in self.steps]
-        self.assertFalse(any('sign windows' in n.lower() for n in names))
-        self.assertFalse(any('azure' in n.lower() for n in names))
+    def test_build_job_has_id_token_permission(self):
+        # Required for the Windows leg's OIDC login to Azure — without it,
+        # azure/login fails with a permissions error at runtime, not at parse time.
+        self.assertEqual(self.build.get('permissions', {}).get('id-token'), 'write')
+
+    def test_build_job_pins_a_stable_environment_for_oidc(self):
+        # The OIDC subject must stay constant across every trigger this
+        # workflow has (branch push, tag push, workflow_dispatch) so a single
+        # Entra federated credential can match all of them. Pinning to a
+        # branch/tag ref instead of an environment is the classic mistake —
+        # it silently breaks the moment you push a release tag.
+        self.assertTrue(self.build.get('environment'),
+                         'build job has no `environment:` — OIDC federated '
+                         'credential would have to be scoped to one exact '
+                         'branch/tag ref instead, which breaks on tag pushes')
+
+    def test_azure_login_step_present_and_windows_only(self):
+        step = self._step('Azure login')
+        self.assertIsNotNone(step)
+        self.assertIn("'windows'", step.get('if', ''))
+        self.assertEqual(step['uses'].split('@')[0], 'azure/login')
+
+    def test_windows_signing_step_present_and_windows_only(self):
+        step = self._step('Sign Windows exe')
+        self.assertIsNotNone(step)
+        self.assertIn("'windows'", step.get('if', ''))
+        self.assertTrue(step['uses'].startswith('azure/artifact-signing-action'))
+        self.assertIn('Shinigami Eyes.exe', step['with']['files'])
 
     def test_macos_signing_pipeline_present_in_order(self):
         """The signing/notarizing/stapling steps must run in this exact
