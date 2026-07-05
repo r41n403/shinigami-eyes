@@ -43,7 +43,7 @@ RCLONE_INSTALL_HINT = (
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION            = '2.1.0'
+VERSION            = '3.0.0'
 BATCH_LIMIT_GB     = 10
 BATCH_LIMIT_BYTES  = BATCH_LIMIT_GB * 1024 ** 3
 MAX_DISK_USE_PCT   = 0.90           # pause staging when disk >90% full

@@ -249,7 +249,7 @@ Pulled via PowerShell's `Get-PhysicalDisk`/`Get-Disk`, which requires the drive 
 - Both builds bundle `shinigami_eyes_logo.png` via `--add-data` so the frozen executable shows the same logo as running from source
 - Trigger paths cover `nas_migrate_gui.py`, `shinigami_eyes_logo.png`, and the workflow file itself — a logo-only change rebuilds too
 
-Pushing a version tag (`git tag v2.2.0 && git push --tags`) additionally publishes a GitHub Release (requires `contents: write`, already configured) with both builds attached as downloadable assets.
+Pushing a version tag (`git tag v3.0.0 && git push --tags`) additionally publishes a GitHub Release (requires `contents: write`, already configured) with both builds attached as downloadable assets.
 
 ---
 
