@@ -57,14 +57,20 @@ jobs:
           brew install python-tk@3.12
           echo "$(brew --prefix python-tk@3.12)/bin" >> $GITHUB_PATH
           echo "$(brew --prefix python@3.12)/bin" >> $GITHUB_PATH
+          # Fail fast if the brew python can't import tkinter — a frozen app
+          # built without Tk dies silently on double-click for end users.
+          python3.12 -c "import tkinter; print('tkinter OK:', tkinter.TkVersion)"
 
       - name: Install PyInstaller (Windows)
         if: matrix.platform == 'windows'
         run: pip install pyinstaller
 
+      # Pinned to python3.12 explicitly: bare `pip3`/`pyinstaller` can resolve
+      # to a different Python on the runner (system 3.13 without Tk), which
+      # produced a frozen app missing the tkinter module entirely.
       - name: Install PyInstaller (macOS)
         if: matrix.platform == 'macos'
-        run: pip3 install --break-system-packages pyinstaller
+        run: python3.12 -m pip install --break-system-packages pyinstaller
 
       # --add-data bundles the logo PNG next to the frozen executable so
       # resource_path() (which checks sys._MEIPASS at runtime) can find it.
@@ -100,7 +106,12 @@ jobs:
 
       - name: Build (macOS)
         if: matrix.platform == 'macos'
-        run: pyinstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
+        run: |
+          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
+          # Smoke test: the frozen binary must be able to import tkinter.
+          # A --windowed PyInstaller app missing a module fails silently on
+          # double-click, so catch it here instead of after release.
+          "dist/Shinigami Eyes.app/Contents/MacOS/Shinigami Eyes" --selfcheck
 
       # Imports the Developer ID Application certificate into a throwaway
       # keychain that only exists for this job — the runner VM is destroyed

@@ -2503,6 +2503,17 @@ class MigrationApp(tk.Tk):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    # --selfcheck: CI smoke test for frozen builds. Verifies critical modules
+    # (esp. tkinter, which PyInstaller has silently omitted before) without
+    # opening a window — headless runners have no display.
+    if '--selfcheck' in sys.argv:
+        print(f'Shinigami Eyes v{VERSION} selfcheck')
+        print(f'  python  : {sys.version.split()[0]}')
+        print(f'  tkinter : {tk.TkVersion}')
+        print(f'  sqlite3 : {sqlite3.sqlite_version}')
+        print('OK')
+        return
+
     app = MigrationApp()
     app.mainloop()
 
