@@ -88,7 +88,7 @@ WHITE   = '#ffffff'
 # JUNK-FILE FILTER
 # ══════════════════════════════════════════════════════════════════════════════
 
-MIN_IMAGE_BYTES = 10 * 1024   # images < 10 KB are icons / thumbnails
+MIN_IMAGE_BYTES = 5 * 1024    # skip image files under 5 KB (true icons/thumbnails only)
 
 SKIP_NAMES = {
     '.ds_store', 'thumbs.db', 'desktop.ini', '.localized', 'autorun.inf',
@@ -98,17 +98,125 @@ SKIP_NAMES = {
 }
 
 SKIP_EXTENSIONS = {
+    # macOS / Windows system junk
     '.ds_store', '.tmp', '.temp', '.part', '.crdownload',
     '.bup', '.ifo',            # DVD metadata
     '.pkginfo', '.pbdevelopment',
+    # Compiled / build artifacts
     '.pyc', '.pyo', '.pycache',
     '.class',                  # Java bytecode
     '.o', '.obj', '.lo', '.la', '.a', '.so', '.dylib',
+    # Logs & databases (system/app internals)
+    '.log', '.sst', '.ldb', '.mdb', '.ldf',
+    # Config / property files (not user content)
+    '.plist', '.ini', '.cfg', '.conf', '.reg',
+    # Code & web assets
+    '.js', '.jsx', '.ts', '.tsx', '.css', '.scss', '.less',
+    '.py', '.rb', '.php', '.sh', '.bat', '.ps1', '.vbs',
+    '.c', '.cpp', '.h', '.hpp', '.java', '.swift', '.kt', '.go', '.rs',
+    '.vue', '.svelte',
+    # Project / IDE files
+    '.workspace', '.xcworkspace', '.xcodeproj', '.pbxproj',
+    '.sln', '.vcxproj', '.csproj', '.gradle',
+    '.lock', '.map', '.sum',
+    # Calendar / contacts (not migrating personal data stores)
+    '.ics', '.vcf', '.abcdp', '.abcdg',
+    # Web browser data
+    '.webbookmark', '.webhistory', '.webloc',
+    # Lightroom cache (previews, not originals)
+    '.lrprev', '.lrmprev', '.lrtemplate',
+    # Source control
+    '.svn-base',
+    # App resources / UI
+    '.nib', '.strings', '.helpindex', '.help', '.scpt',
+    # Misc system
+    '.lockfile', '.ipmeta', '.mcdb', '.wflow',
+    '.dat', '.data', '.db', '.ims',
+    # Cache / index
+    '.cache', '.idx', '.pack', '.manifest', '.babelrc',
 }
 
 IMAGE_EXTENSIONS = {
-    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
-    '.webp', '.heic', '.heif', '.ico', '.icns', '.cur', '.svg',
+    # JPEG variants
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.jif',
+    # JPEG 2000
+    '.jp2', '.j2k', '.jpf', '.jpx', '.jpm', '.jpg2', '.j2c', '.jpc',
+    # Modern formats
+    '.png', '.apng',
+    '.gif',
+    '.webp',
+    '.avif', '.avifs',
+    '.jxl',                                  # JPEG XL
+    '.jxr', '.hdp', '.wdp',                  # JPEG XR / HD Photo
+    # HEIF/HEIC (Apple, modern cameras)
+    '.heic', '.heif', '.heics', '.heifs', '.hif',
+    # Bitmap variants
+    '.bmp', '.dib',
+    '.tiff', '.tif',
+    '.tga', '.icb', '.vda', '.vst',          # Targa
+    '.pcx',                                  # PC Paintbrush
+    '.ppm', '.pgm', '.pbm', '.pnm', '.pfm', # Netpbm
+    '.xbm', '.xpm',                          # X11 bitmap
+    '.wbmp',                                 # WAP bitmap
+    # Vector / graphics
+    '.svg', '.svgz',
+    # HDR / scientific / cinema
+    '.hdr', '.rgbe',
+    '.exr',                                  # OpenEXR
+    '.dpx', '.cin',                          # Cineon / DPX (film scanning)
+    # Icons
+    '.ico', '.icns', '.cur',
+    # Legacy formats
+    '.pic', '.pict', '.pct',                 # Mac PICT
+    '.sgi', '.rgb', '.rgba', '.bw',          # SGI
+    '.ilbm', '.iff', '.lbm',                 # Amiga IFF
+    '.mng',                                  # Multiple-image Network Graphics
+    '.mpo', '.mpf',                          # Multi-Picture Object (3D JPEG / Fuji)
+    '.pcd',                                  # Kodak Photo CD
+    '.yuv',                                  # Raw YUV data
+    # Layered / paint files
+    '.xcf',                                  # GIMP
+    '.ora',                                  # OpenRaster
+    '.kra',                                  # Krita
+    '.psb',                                  # Photoshop large document
+    # Camera video → Photos (camera-originated, not internet downloads)
+    '.mts', '.m2ts', '.m2t',                 # AVCHD (Sony, Panasonic)
+    '.mod', '.tod',                          # JVC / Panasonic camcorder
+    '.dv', '.dif',                           # DV camcorder
+    '.hdv',                                  # HDV camcorder
+    '.3gp', '.3g2',                          # Mobile camera video
+    '.mxf',                                  # Professional camera container
+    '.braw',                                 # Blackmagic RAW
+    '.r3d',                                  # RED camera RAW
+    '.ari',                                  # ARRI camera RAW
+    # RAW camera formats
+    '.raw', '.dng',                          # Generic / Adobe DNG
+    '.cr2', '.cr3', '.crw', '.ciff',         # Canon
+    '.nef', '.nrw',                          # Nikon
+    '.arw', '.srf', '.sr2', '.sraw',         # Sony
+    '.orf',                                  # Olympus
+    '.rw2', '.rw1',                          # Panasonic / Leica variant
+    '.raf',                                  # Fujifilm
+    '.3fr', '.fff', '.eff',                  # Hasselblad
+    '.iiq', '.cap', '.eip',                  # Phase One
+    '.mrw', '.mdc',                          # Minolta / Konica-Minolta / Agfa
+    '.erf',                                  # Epson
+    '.kdc', '.dcr', '.dc2', '.dcs', '.drf', '.k25',  # Kodak
+    '.rwl', '.rwz',                          # Leica
+    '.pef', '.ptx',                          # Pentax
+    '.x3f', '.sd0', '.sd1', '.sdc',         # Sigma
+    '.srw',                                  # Samsung
+    '.mef', '.mos', '.mfw',                  # Mamiya / Leaf
+    '.bay',                                  # Casio
+    '.cs1',                                  # CaptureShop RAW
+    '.pxn',                                  # Logitech RAW
+    '.pxr',                                  # Pixar image
+    '.qtk',                                  # Apple QuickTake
+    '.sti', '.stk',                          # Sinar
+    '.ra2',                                  # Rawker
+    # Apple Aperture library files
+    '.apmaster', '.apversion',               # Aperture originals and versions
+    '.apdetected', '.apalbum', '.apfolder',  # Aperture metadata
 }
 
 SKIP_PATH_PARTS = {
@@ -134,10 +242,16 @@ DOC_EXTENSIONS = {
     '.pages', '.numbers', '.key', '.txt', '.rtf', '.odt', '.ods',
     '.csv', '.json', '.xml', '.html', '.htm', '.md',
     '.zip', '.rar', '.7z', '.tar', '.gz', '.dmg', '.iso',
-    '.mp4', '.mov', '.avi', '.mkv', '.m4v', '.mts', '.m2ts',
+    '.mp4', '.mov', '.avi', '.mkv', '.m4v',
     '.mp3', '.aac', '.flac', '.wav', '.aiff', '.m4a',
     '.psd', '.ai', '.eps', '.indd', '.sketch', '.fig', '.xd',
     '.prproj', '.aep', '.fcpx', '.ppj', '.drp',
+    # Email — Apple Mail and Outlook for Mac
+    '.emlx', '.emlxpart',                    # Apple Mail
+    '.eml', '.msg',                          # Standard email
+    '.olk14message', '.olk14msgsource',      # Outlook for Mac messages
+    '.olk14contact', '.olk14folder',         # Outlook contacts / folders
+    '.olk14category', '.olk14task',          # Outlook metadata
 }
 
 
@@ -511,7 +625,10 @@ def progress_file_for(output_path: str, source_path: str) -> Path:
 def copy_and_hash(src: str, dest_dir: str) -> tuple[str, str, int]:
     """Single-pass: copy + MD5 simultaneously. Returns (hash, tmp_path, bytes).
     Raises ValueError if bytes written don't match bytes read (write integrity check)."""
-    h   = hashlib.md5()
+    try:
+        h = hashlib.md5(usedforsecurity=False)   # required on some macOS/Python builds
+    except TypeError:
+        h = hashlib.md5()                        # older Python without the flag
     tmp = os.path.join(dest_dir, f'.se_{os.getpid()}_{os.urandom(4).hex()}')
     written = 0
     try:
@@ -1235,6 +1352,14 @@ class DriveWorker:
                         self._on_progress(s)
                         continue
 
+                    # Skip non-regular files (aliases, symlinks to dirs,
+                    # device nodes, named pipes — unreadable as byte streams)
+                    if not os.path.isfile(filepath) or os.path.islink(filepath):
+                        s.skipped_sys += 1
+                        skip_reasons['non-regular file'] = skip_reasons.get('non-regular file', 0) + 1
+                        self._on_progress(s)
+                        continue
+
                     if filepath in processed:
                         s.skipped_resume += 1
                         skip_reasons['already done (resume)'] = skip_reasons.get('already done (resume)', 0) + 1
@@ -1296,6 +1421,12 @@ class DriveWorker:
                             if drive_gone:
                                 self._log(f'  [{label}] Drive removed — stopping this worker', 'err')
                                 return
+                        continue
+                    except TypeError:
+                        # Unreadable file type (alias, special file, HFS+ compressed)
+                        s.skipped_sys += 1
+                        skip_reasons['unreadable type'] = skip_reasons.get('unreadable type', 0) + 1
+                        self._on_progress(s)
                         continue
                     except Exception as e:
                         s.errors += 1
@@ -1368,15 +1499,14 @@ class DriveWorker:
                    f' {s.skipped_resume:,} resumed · {s.errors:,} errors ·'
                    f' {_fmt_bytes(s.bytes_copied)}')
 
-        # Walk summary — helps diagnose drives that finish unexpectedly fast
+        # Walk summary — always log skip breakdown so drive behaviour is diagnosable
         if files_seen == 0:
             self._log(f'  [{label}] ⚠️  Walk found 0 files — drive may be empty, '
                       f'unreadable, or data is in APFS snapshots (Time Machine)', 'warn')
-        elif s.copied == 0 and skip_reasons:
+        if skip_reasons:
             reasons_str = '  ·  '.join(f'{v:,} {k}' for k, v in
                                        sorted(skip_reasons.items(), key=lambda x: -x[1]))
-            self._log(f'  [{label}] ℹ️  0 files copied — {files_seen:,} seen, '
-                      f'all skipped: {reasons_str}', 'warn')
+            self._log(f'  [{label}] ℹ️  {files_seen:,} seen · skipped: {reasons_str}', 'info')
 
         self._log(f'  [{label}] ✓ DONE — {summary}', 'ok')
         send_ntfy(
@@ -1645,7 +1775,8 @@ class MigrationApp(tk.Tk):
         self.title(f'Shinigami Eyes  v{VERSION}')
         self.configure(bg=BG)
         self.resizable(True, True)
-        self.minsize(700, 600)
+        self.minsize(700, 800)
+        self.geometry('820x1000')
 
         self._rclone_path = find_rclone()
         self._gd_path     = find_gdrive()
@@ -1667,8 +1798,17 @@ class MigrationApp(tk.Tk):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        outer = tk.Frame(self, bg=BG, padx=24, pady=16)
-        outer.pack(fill='both', expand=True)
+        # Vertical split — drag the sash to resize the log area
+        paned = tk.PanedWindow(self, orient=tk.VERTICAL, bg=YELLOW,
+                               sashwidth=10, sashrelief='groove',
+                               showhandle=True, handlesize=24, handlepad=12)
+        paned.pack(fill='both', expand=True)
+
+        outer = tk.Frame(paned, bg=BG, padx=24, pady=16)
+        paned.add(outer, stretch='always', minsize=400)
+
+        log_frame = tk.Frame(paned, bg=BG, padx=24, pady=(0, 16))
+        paned.add(log_frame, stretch='always', minsize=120)
 
         # Title — stylised logo image, falling back to plain text if the
         # asset is missing or this Tk build can't load PNGs.
@@ -1844,17 +1984,23 @@ class MigrationApp(tk.Tk):
             state='disabled', command=self._stop)
         self.btn_stop.pack(side='left')
 
-        # ── Status + log ──────────────────────────────────────────────────────
+        # ── Status + log (bottom pane — drag the sash to resize) ─────────────
         self.var_status = tk.StringVar(value='Ready')
-        tk.Label(outer, textvariable=self.var_status,
-                 font=(MONO_FONT, 10), fg='#ffffff', bg=BG, anchor='w').pack(fill='x', pady=(8, 2))
+        tk.Label(log_frame, textvariable=self.var_status,
+                 font=(MONO_FONT, 10), fg='#ffffff', bg=BG, anchor='w').pack(fill='x', pady=(4, 2))
 
-        self.log_box = tk.Text(outer, height=14, bg=SURFACE, fg=FG,
+        log_container = tk.Frame(log_frame, bg=BG)
+        log_container.pack(fill='both', expand=True)
+
+        sb = ttk.Scrollbar(log_container)
+        sb.pack(side='right', fill='y')
+
+        self.log_box = tk.Text(log_container, bg=SURFACE, fg=FG,
                                font=(MONO_FONT, 10), relief='flat',
-                               state='disabled', wrap='word')
-        self.log_box.pack(fill='both', expand=True, pady=(2, 0))
-        sb = ttk.Scrollbar(self.log_box, command=self.log_box.yview)
-        self.log_box['yscrollcommand'] = sb.set
+                               state='disabled', wrap='word',
+                               yscrollcommand=sb.set)
+        self.log_box.pack(side='left', fill='both', expand=True)
+        sb.config(command=self.log_box.yview)
 
         # Log tags
         for tag, color in [('ok', GREEN), ('err', RED), ('warn', YELLOW),
@@ -2132,6 +2278,18 @@ class MigrationApp(tk.Tk):
                 self._log(f'  ✓ Merged {merged:,} hash(es) from other machine(s)', 'ok')
             else:
                 self._log('  ✓ No new remote hashes to merge', 'info')
+            # Push this machine's full registry to B2 immediately so other
+            # machines can see it — critical for bootstrapping a machine that
+            # has existing hashes that have never been pushed before.
+            self._registry.flush()
+            self._registry.checkpoint()
+            threading.Thread(
+                target=push_local_hashes,
+                args=(self._rclone_path, b2_key_id, b2_app_key,
+                      b2_bucket, get_machine_id()),
+                kwargs={'log_fn': self._log},
+                daemon=True,
+            ).start()
 
         # Upload coordinator
         if self._coordinator is not None:
