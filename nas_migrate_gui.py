@@ -706,7 +706,8 @@ def find_rclone() -> str:
             'rclone',
         ]
     else:
-        candidates = ['/opt/homebrew/bin/rclone', '/usr/local/bin/rclone',
+        candidates = [resource_path('rclone'),   # bundled inside the .app
+                      '/opt/homebrew/bin/rclone', '/usr/local/bin/rclone',
                       shutil.which('rclone'), 'rclone']
     for p in candidates:
         if not p:
