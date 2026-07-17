@@ -115,10 +115,10 @@ class TestBuildMatrix(unittest.TestCase):
         names = [m['artifact_name'] for m in self.matrix_entries]
         self.assertEqual(len(names), len(set(names)), 'duplicate artifact_name in matrix')
 
-    def test_windows_artifact_is_exe_macos_is_zip(self):
+    def test_windows_artifact_is_exe_macos_is_dmg(self):
         by_platform = {m['platform']: m for m in self.matrix_entries}
         self.assertTrue(by_platform['windows']['artifact_path'].endswith('.exe'))
-        self.assertTrue(by_platform['macos']['artifact_path'].endswith('.zip'))
+        self.assertTrue(by_platform['macos']['artifact_path'].endswith('.dmg'))
 
     def test_fail_fast_disabled(self):
         # One platform's build failing shouldn't cancel the other mid-build.
@@ -185,17 +185,25 @@ class TestBuildSteps(unittest.TestCase):
         self.assertNotIn('shinigami_eyes_logo.png:.', win['run'])
         self.assertNotIn('shinigami_eyes_logo.png;.', mac['run'])
 
-    def test_macos_zip_step_uses_ditto_and_matches_matrix_artifact_path(self):
-        zip_step = self._step('Zip macOS app bundle')
-        self.assertIsNotNone(zip_step)
-        self.assertIn('ditto', zip_step['run'])
-        self.assertIn('Shinigami Eyes.app', zip_step['run'])
+    def test_macos_dmg_step_builds_installer_and_matches_matrix_artifact_path(self):
+        dmg_step = self._step('Create DMG')
+        self.assertIsNotNone(dmg_step)
+        self.assertIn('hdiutil', dmg_step['run'])
+        self.assertIn('Shinigami Eyes.app', dmg_step['run'])
+        # The /Applications symlink is the entire point of shipping a dmg —
+        # without it there's no drag-to-install target in the mounted volume.
+        self.assertIn('ln -s /Applications', dmg_step['run'],
+                      'dmg has no Applications symlink — no drag-to-install UX')
+        # The dmg itself must be notarized and stapled, otherwise Gatekeeper
+        # shows a scary prompt before the user can even mount it.
+        self.assertIn('notarytool submit', dmg_step['run'])
+        self.assertIn('stapler staple', dmg_step['run'])
 
         matrix = self.data['jobs']['build']['strategy']['matrix']['include']
         macos_entry = next(m for m in matrix if m['platform'] == 'macos')
-        zip_name = Path(macos_entry['artifact_path']).name
-        self.assertIn(zip_name, zip_step['run'],
-                      'zip step does not produce the file name the matrix expects to upload')
+        dmg_name = Path(macos_entry['artifact_path']).name
+        self.assertIn(dmg_name, dmg_step['run'],
+                      'dmg step does not produce the file name the matrix expects to upload')
 
     def test_upload_artifact_step_is_templated_not_hardcoded(self):
         upload = self._step('Upload artifact')
@@ -212,8 +220,11 @@ class TestReleaseJob(unittest.TestCase):
     def test_depends_on_build(self):
         self.assertEqual(self.release['needs'], 'build')
 
-    def test_only_runs_on_version_tags(self):
-        self.assertIn("startsWith(github.ref, 'refs/tags/v')", self.release['if'])
+    def test_runs_for_any_published_release(self):
+        # Regression: v3.3 was tagged without the 'v' prefix and the old
+        # startsWith-only check silently skipped the release job — binaries
+        # built fine but never attached. Any published release must qualify.
+        self.assertIn("github.event_name == 'release'", self.release['if'])
 
     def test_has_contents_write_permission(self):
         # Without this, softprops/action-gh-release fails to create the
@@ -311,8 +322,8 @@ class TestCodeSigning(unittest.TestCase):
 
     def test_macos_signing_pipeline_present_in_order(self):
         """The signing/notarizing/stapling steps must run in this exact
-        order relative to the build and the final zip — e.g. stapling has to
-        happen before the distributable zip is made, or the shipped app
+        order relative to the build and the final dmg — e.g. stapling has to
+        happen before the distributable dmg is made, or the shipped app
         never actually gets its notarization ticket attached."""
         names = [s.get('name', '') for s in self.steps]
         required_order = [
@@ -320,7 +331,7 @@ class TestCodeSigning(unittest.TestCase):
             'Import Developer ID certificate',
             'Code sign app bundle',
             'Notarize app',
-            'Zip macOS app bundle',
+            'Create DMG (macOS)',
         ]
         for n in required_order:
             self.assertIn(n, names, f'missing step: {n}')

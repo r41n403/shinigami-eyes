@@ -44,7 +44,7 @@ jobs:
           - os: macos-latest
             platform: macos
             artifact_name: ShinigamiEyes-macOS
-            artifact_path: dist/Shinigami Eyes-macOS.zip
+            artifact_path: dist/Shinigami Eyes-macOS.dmg
 
     runs-on: ${{ matrix.os }}
 
@@ -157,7 +157,7 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "dist/Shinigami Eyes.app"
 
       # Apple only notarizes zip/dmg/pkg submissions, not a raw .app — so this
-      # zip is just for the upload, separate from the final distributable zip
+      # zip is just for the upload, separate from the final distributable dmg
       # below (which is built from the .app *after* stapling).
       - name: Notarize app
         if: matrix.platform == 'macos'
@@ -176,11 +176,33 @@ jobs:
           xcrun stapler staple "Shinigami Eyes.app"
           rm notarize-submission.zip
 
-      - name: Zip macOS app bundle
+      # DMG with an /Applications symlink — the standard macOS install UX:
+      # open the dmg, drag the app onto the Applications shortcut. The dmg
+      # itself is signed, notarized, and stapled so Gatekeeper accepts it
+      # without any "verifying" delay even before the app inside is checked.
+      - name: Create DMG (macOS)
         if: matrix.platform == 'macos'
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           cd dist
-          ditto -c -k --sequesterRsrc --keepParent "Shinigami Eyes.app" "Shinigami Eyes-macOS.zip"
+          mkdir dmg-staging
+          cp -R "Shinigami Eyes.app" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "Shinigami Eyes" -srcfolder dmg-staging \
+            -ov -format UDZO "Shinigami Eyes-macOS.dmg"
+          rm -rf dmg-staging
+          codesign --force --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "Shinigami Eyes-macOS.dmg"
+          xcrun notarytool submit "Shinigami Eyes-macOS.dmg" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "Shinigami Eyes-macOS.dmg"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -191,7 +213,11 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Any published release qualifies — v3.3 was once tagged without the 'v'
+    # prefix and the old startsWith(refs/tags/v) check silently skipped this
+    # job, shipping a release with no binaries. The ref check remains only
+    # for workflow_dispatch runs launched from a tag.
+    if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -204,12 +230,12 @@ jobs:
       - name: Package Windows exe
         run: cp "artifacts/ShinigamiEyes-Windows/Shinigami Eyes.exe" "./Shinigami Eyes-Windows.exe"
 
-      - name: Package macOS zip
-        run: cp "artifacts/ShinigamiEyes-macOS/Shinigami Eyes-macOS.zip" "./Shinigami Eyes-macOS.zip"
+      - name: Package macOS dmg
+        run: cp "artifacts/ShinigamiEyes-macOS/Shinigami Eyes-macOS.dmg" "./Shinigami Eyes-macOS.dmg"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             Shinigami Eyes-Windows.exe
-            Shinigami Eyes-macOS.zip
+            Shinigami Eyes-macOS.dmg
