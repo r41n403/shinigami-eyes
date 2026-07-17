@@ -185,6 +185,20 @@ class TestBuildSteps(unittest.TestCase):
         self.assertNotIn('shinigami_eyes_logo.png:.', win['run'])
         self.assertNotIn('shinigami_eyes_logo.png;.', mac['run'])
 
+    def test_macos_bundles_rclone(self):
+        # rclone ships inside the .app so cloud destinations work with zero
+        # user setup. The download step must precede the build step, and the
+        # build must actually pack the binary via --add-binary.
+        dl = self._step('Download rclone')
+        self.assertIsNotNone(dl, 'no rclone download step — .app would ship without it')
+        self.assertIn('downloads.rclone.org', dl['run'])
+        build = self._step('Build (macOS)')
+        self.assertIn('--add-binary "rclone:."', build['run'],
+                      'rclone downloaded but not bundled into the .app')
+        names = [s.get('name', '') for s in self.steps]
+        self.assertLess(names.index(dl['name']), names.index(build['name']),
+                        'rclone must be downloaded before the build packs it')
+
     def test_macos_dmg_step_builds_installer_and_matches_matrix_artifact_path(self):
         dmg_step = self._step('Create DMG')
         self.assertIsNotNone(dmg_step)

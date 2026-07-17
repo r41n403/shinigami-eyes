@@ -111,10 +111,22 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      # Bundle rclone inside the .app so B2/Google Drive work out of the box —
+      # no brew install needed by the user. MIT-licensed, redistribution OK.
+      # The binary is signed along with the rest of the bundle by the
+      # codesign --deep step below, so notarization accepts it.
+      - name: Download rclone (macOS bundling)
+        if: matrix.platform == 'macos'
+        run: |
+          curl -sSL https://downloads.rclone.org/rclone-current-osx-arm64.zip -o rclone.zip
+          unzip -j rclone.zip '*/rclone' -d .
+          chmod +x rclone
+          ./rclone version
+
       - name: Build (macOS)
         if: matrix.platform == 'macos'
         run: |
-          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --icon shinigami_eyes.icns --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
+          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --icon shinigami_eyes.icns --add-data "shinigami_eyes_logo.png:." --add-binary "rclone:." nas_migrate_gui.py
           # Smoke tests on the frozen binary. A --windowed PyInstaller app
           # fails silently on double-click, so catch launch crashes here
           # instead of after release:

@@ -23,7 +23,7 @@ Grab the latest from the [Releases page](https://github.com/r41n403/shinigami-ey
 
 Both are code-signed and notarized — no security warnings, no dependencies to install. The app checks for updates on launch and offers a one-click download when a new version is out.
 
-For cloud destinations the app uses [rclone](https://rclone.org): `brew install rclone` on Mac; on Windows the app offers to install it for you.
+Cloud uploads are powered by [rclone](https://rclone.org) — it's built into the Mac app, and on Windows the app offers to install it for you with one click.
 
 ---
 
