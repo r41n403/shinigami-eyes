@@ -185,6 +185,28 @@ class TestBuildSteps(unittest.TestCase):
         self.assertNotIn('shinigami_eyes_logo.png:.', win['run'])
         self.assertNotIn('shinigami_eyes_logo.png;.', mac['run'])
 
+    def test_version_stamped_from_release_tag(self):
+        # Regression: v3.4.0 shipped with VERSION = '3.0.0' because nobody
+        # bumped the constant — the in-app updater then offered v3.4.0 as an
+        # update to itself. Release builds must stamp VERSION from the tag.
+        stamp = self._step('Stamp version')
+        self.assertIsNotNone(stamp, 'no version-stamp step — VERSION can drift from the tag')
+        self.assertIn("github.event_name == 'release'", stamp['if'])
+        names = [s.get('name', '') for s in self.steps]
+        self.assertLess(names.index(stamp['name']), names.index('Build (macOS)'),
+                        'version must be stamped before the build consumes it')
+
+    def test_macos_bundle_version_set_before_signing(self):
+        # PyInstaller writes CFBundleShortVersionString=0.0.0; the About
+        # window shows it. Patch must happen before codesign or it breaks
+        # the signature.
+        plist = self._step('Set bundle version')
+        self.assertIsNotNone(plist, 'no Info.plist version step — About shows 0.0.0')
+        self.assertIn('CFBundleShortVersionString', plist['run'])
+        names = [s.get('name', '') for s in self.steps]
+        self.assertLess(names.index(plist['name']), names.index('Code sign app bundle'),
+                        'plist edit after codesign invalidates the signature')
+
     def test_macos_bundles_rclone(self):
         # rclone ships inside the .app so cloud destinations work with zero
         # user setup. The download step must precede the build step, and the
