@@ -6,9 +6,16 @@ on:
     paths:
       - 'nas_migrate_gui.py'
       - 'shinigami_eyes_logo.png'
+      - 'shinigami_eyes.ico'
+      - 'shinigami_eyes.icns'
       - '.github/workflows/build-executables.yml'
-    tags:
-      - 'v*.*.*'
+  # NOT `push: tags:` — a `paths` filter applies to every push event
+  # including tag pushes, and tag pushes don't match it, so tag-triggered
+  # runs were silently skipped (v3.1.0 released with no binaries). Trigger
+  # on release publication instead: github.ref is the tag ref
+  # (refs/tags/vX.Y.Z), so the release job's startsWith check still works.
+  release:
+    types: [published]
   workflow_dispatch:
 
 jobs:

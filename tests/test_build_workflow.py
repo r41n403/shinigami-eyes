@@ -74,9 +74,20 @@ class TestTriggers(unittest.TestCase):
                        'logo asset not in trigger paths — a logo-only change would not rebuild')
         self.assertIn('.github/workflows/build-executables.yml', paths)
 
-    def test_tag_trigger_matches_semver_pattern(self):
-        tags = self.on['push']['tags']
-        self.assertIn('v*.*.*', tags)
+    def test_release_trigger_present(self):
+        # Regression: tags used to live under `push:`, but a `paths` filter
+        # applies to ALL push events including tag pushes — which never match
+        # it, so tag-triggered builds were silently skipped and v3.1.0
+        # released with no binaries. Releases must trigger via the release
+        # event instead.
+        self.assertIn('release', self.on,
+                      'no release trigger — published releases would get no binaries')
+        self.assertIn('published', self.on['release']['types'])
+
+    def test_tags_not_under_push(self):
+        # tags + paths under the same push key silently never fire (see above)
+        self.assertNotIn('tags', self.on.get('push', {}),
+                         'tags under push: are filtered out by the paths filter')
 
     def test_manual_dispatch_enabled(self):
         self.assertIn('workflow_dispatch', self.on)
