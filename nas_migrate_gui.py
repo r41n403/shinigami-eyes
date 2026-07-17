@@ -981,6 +981,67 @@ def push_local_hashes(rclone_path: str, b2_key_id: str, b2_app_key: str,
         log(f'  WARN  could not push hash DB to B2: {e}', 'warn')
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# UPDATE CHECK  — GitHub Releases, quiet startup check + one-click download
+# ══════════════════════════════════════════════════════════════════════════════
+
+UPDATE_REPO = 'r41n403/shinigami-eyes'
+
+
+def _parse_version(v: str) -> tuple:
+    """'v3.4.1' / '3.4.1' → (3, 4, 1). Non-numeric junk ignored."""
+    nums = re.findall(r'\d+', v)
+    return tuple(int(n) for n in nums[:3]) if nums else (0,)
+
+
+def check_latest_release() -> Optional[dict]:
+    """Return {'version', 'url', 'asset'} if a newer release with an asset
+    for this platform exists, else None. Quiet by design — never raises,
+    returns None on any network/API problem."""
+    try:
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{UPDATE_REPO}/releases/latest',
+            headers={'Accept': 'application/vnd.github+json',
+                     'User-Agent': f'ShinigamiEyes/{VERSION}'})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rel = json.load(r)
+        latest = rel.get('tag_name', '')
+        if _parse_version(latest) <= _parse_version(VERSION):
+            return None
+        want = '.dmg' if IS_MAC else ('.exe' if IS_WINDOWS else None)
+        if not want:
+            return None
+        for asset in rel.get('assets', []):
+            if asset.get('name', '').lower().endswith(want):
+                return {'version': latest,
+                        'url':     asset['browser_download_url'],
+                        'asset':   asset['name']}
+        return None
+    except Exception:
+        return None
+
+
+def download_and_open_update(update: dict, on_status=None) -> bool:
+    """Download the release asset to ~/Downloads and open it — mounts the
+    dmg on macOS (drag to replace), runs the installer exe on Windows.
+    Deliberately not a silent self-replace: Gatekeeper/SmartScreen verify
+    the signed download and the user stays in control of the swap."""
+    status = on_status or (lambda msg: None)
+    try:
+        dest = Path.home() / 'Downloads' / update['asset']
+        status(f'Downloading {update["version"]}…')
+        urllib.request.urlretrieve(update['url'], str(dest))
+        status('Opening installer…')
+        if IS_MAC:
+            subprocess.run(['open', str(dest)], timeout=30)
+        elif IS_WINDOWS:
+            os.startfile(str(dest))          # noqa — Windows-only API
+        return True
+    except Exception as e:
+        status(f'Update failed: {e}')
+        return False
+
+
 def cleanup_orphan_stages():
     for d in glob.glob(os.path.join(tempfile.gettempdir(), 'se_stage_*')):
         try:
@@ -1794,6 +1855,46 @@ class MigrationApp(tk.Tk):
 
         self._build_ui()
         self.after(300, cleanup_orphan_stages)
+        threading.Thread(target=self._check_updates_async,
+                         daemon=True, name='update-check').start()
+
+    # ── Update check ──────────────────────────────────────────────────────────
+
+    def _check_updates_async(self):
+        upd = check_latest_release()
+        if upd:
+            self.after(0, lambda: self._show_update_banner(upd))
+
+    def _show_update_banner(self, upd: dict):
+        banner = tk.Frame(self._outer, bg=SURFACE)
+        tk.Label(banner,
+                 text=f'⬆  Update available: {upd["version"]}  (you have v{VERSION})',
+                 font=(MONO_FONT, 10, 'bold'), fg=YELLOW, bg=SURFACE
+                 ).pack(side='left', padx=10, pady=6)
+        btn = tk.Button(banner, text='Download & Install',
+                        font=(MONO_FONT, 10, 'bold'), bg=YELLOW, fg='#000',
+                        activebackground='#ccb400', activeforeground='#000',
+                        relief='flat', padx=12, pady=3, cursor='hand2')
+        btn.config(command=lambda: self._do_update(upd, btn))
+        btn.pack(side='right', padx=10, pady=6)
+        # Insert above everything else in the top pane
+        children = self._outer.winfo_children()
+        if children and children[0] is not banner:
+            banner.pack(fill='x', pady=(0, 10), before=children[0])
+        else:
+            banner.pack(fill='x', pady=(0, 10))
+
+    def _do_update(self, upd: dict, btn: tk.Button):
+        btn.config(state='disabled', text='Downloading…')
+
+        def set_status(msg):
+            self.after(0, lambda: btn.config(text=msg))
+
+        def work():
+            if download_and_open_update(upd, on_status=set_status):
+                set_status('Installer opened — quit the app and replace it')
+
+        threading.Thread(target=work, daemon=True, name='update-dl').start()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -1806,6 +1907,7 @@ class MigrationApp(tk.Tk):
 
         outer = tk.Frame(paned, bg=BG, padx=24, pady=16)
         paned.add(outer, stretch='always', minsize=400)
+        self._outer = outer   # update banner inserts itself at the top of this
 
         # NB: Frame padx/pady must be single values — tuple (top, bottom)
         # syntax is only valid in pack()/grid(), and the bundled Tk rejects
