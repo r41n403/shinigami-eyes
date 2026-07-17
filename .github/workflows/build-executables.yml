@@ -78,7 +78,7 @@ jobs:
       # everywhere else, because ':' collides with Windows drive letters.
       - name: Build (Windows)
         if: matrix.platform == 'windows'
-        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
+        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --icon shinigami_eyes.ico --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
 
       # Code-signs dist\Shinigami Eyes.exe via Azure Artifact Signing (formerly
       # Trusted Signing). Requires a one-time Azure setup (signing account +
@@ -107,7 +107,7 @@ jobs:
       - name: Build (macOS)
         if: matrix.platform == 'macos'
         run: |
-          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
+          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --icon shinigami_eyes.icns --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
           # Smoke test: the frozen binary must be able to import tkinter.
           # A --windowed PyInstaller app missing a module fails silently on
           # double-click, so catch it here instead of after release.
