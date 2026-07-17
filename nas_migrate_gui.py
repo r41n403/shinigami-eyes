@@ -43,7 +43,10 @@ RCLONE_INSTALL_HINT = (
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-VERSION            = '3.0.0'
+# NB: for release builds, CI overwrites this with the release tag at build
+# time (see "Stamp version from release tag" in build-executables.yml), so
+# the built app always self-reports the version it was released as.
+VERSION            = '3.4.0'
 BATCH_LIMIT_GB     = 10
 BATCH_LIMIT_BYTES  = BATCH_LIMIT_GB * 1024 ** 3
 MAX_DISK_USE_PCT   = 0.90           # pause staging when disk >90% full

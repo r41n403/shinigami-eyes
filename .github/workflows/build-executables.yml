@@ -52,6 +52,26 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      # For release/tag builds, overwrite the VERSION constant with the tag
+      # so the shipped app always self-reports its release version. v3.4.0
+      # once shipped believing it was v3.0.0 (nobody bumped the constant),
+      # which made the in-app updater offer itself as an update.
+      - name: Stamp version from release tag
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          python - "$TAG" << 'EOF'
+          import re, sys, pathlib
+          tag = sys.argv[1]
+          p = pathlib.Path('nas_migrate_gui.py')
+          src, n = re.subn(r"^VERSION(\s*)=\s*'[^']*'",
+                           rf"VERSION\g<1>= '{tag}'", p.read_text(), count=1, flags=re.M)
+          assert n == 1, 'VERSION constant not found'
+          p.write_text(src)
+          EOF
+          grep -m1 "^VERSION" nas_migrate_gui.py
+
       - name: Set up Python (Windows)
         if: matrix.platform == 'windows'
         uses: actions/setup-python@v5
@@ -134,6 +154,18 @@ jobs:
           #   --uicheck:   full UI construction (caught TclError in v3.1.1)
           "dist/Shinigami Eyes.app/Contents/MacOS/Shinigami Eyes" --selfcheck
           "dist/Shinigami Eyes.app/Contents/MacOS/Shinigami Eyes" --uicheck
+
+      # Write the real version into the bundle's Info.plist — PyInstaller
+      # defaults CFBundleShortVersionString to 0.0.0, which is what Finder's
+      # Get Info and the About window display. Must run BEFORE codesign:
+      # editing the plist afterwards would invalidate the signature.
+      - name: Set bundle version (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          V=$(python3.12 -c "import re; print(re.search(r\"^VERSION\s*=\s*'([^']+)'\", open('nas_migrate_gui.py').read(), re.M).group(1))")
+          plutil -replace CFBundleShortVersionString -string "$V" "dist/Shinigami Eyes.app/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$V" "dist/Shinigami Eyes.app/Contents/Info.plist"
+          echo "Bundle version set to $V"
 
       # Imports the Developer ID Application certificate into a throwaway
       # keychain that only exists for this job — the runner VM is destroyed
