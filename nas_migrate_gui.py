@@ -1807,7 +1807,10 @@ class MigrationApp(tk.Tk):
         outer = tk.Frame(paned, bg=BG, padx=24, pady=16)
         paned.add(outer, stretch='always', minsize=400)
 
-        log_frame = tk.Frame(paned, bg=BG, padx=24, pady=(0, 16))
+        # NB: Frame padx/pady must be single values — tuple (top, bottom)
+        # syntax is only valid in pack()/grid(), and the bundled Tk rejects
+        # it with "expected screen distance" (crashed the frozen app once).
+        log_frame = tk.Frame(paned, bg=BG, padx=24, pady=8)
         paned.add(log_frame, stretch='always', minsize=120)
 
         # Title — stylised logo image, falling back to plain text if the
@@ -2512,6 +2515,17 @@ def main():
         print(f'  tkinter : {tk.TkVersion}')
         print(f'  sqlite3 : {sqlite3.sqlite_version}')
         print('OK')
+        return
+
+    # --uicheck: construct the FULL UI, pump one event-loop pass, tear down.
+    # Catches widget-construction bugs that import checks can't (e.g. the
+    # tuple-pady TclError that crashed v3.1.1 on launch). Requires a display,
+    # which GitHub's macOS runners have.
+    if '--uicheck' in sys.argv:
+        app = MigrationApp()
+        app.update()
+        app.destroy()
+        print(f'Shinigami Eyes v{VERSION} uicheck OK')
         return
 
     app = MigrationApp()

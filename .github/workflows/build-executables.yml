@@ -115,10 +115,13 @@ jobs:
         if: matrix.platform == 'macos'
         run: |
           python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --icon shinigami_eyes.icns --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
-          # Smoke test: the frozen binary must be able to import tkinter.
-          # A --windowed PyInstaller app missing a module fails silently on
-          # double-click, so catch it here instead of after release.
+          # Smoke tests on the frozen binary. A --windowed PyInstaller app
+          # fails silently on double-click, so catch launch crashes here
+          # instead of after release:
+          #   --selfcheck: imports (caught missing tkinter in v3.1.0)
+          #   --uicheck:   full UI construction (caught TclError in v3.1.1)
           "dist/Shinigami Eyes.app/Contents/MacOS/Shinigami Eyes" --selfcheck
+          "dist/Shinigami Eyes.app/Contents/MacOS/Shinigami Eyes" --uicheck
 
       # Imports the Developer ID Application certificate into a throwaway
       # keychain that only exists for this job — the runner VM is destroyed
