@@ -9,267 +9,75 @@
 [![Latest Release](https://img.shields.io/github/v/release/r41n403/shinigami-eyes?include_prereleases&label=release)](https://github.com/r41n403/shinigami-eyes/releases/latest)
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?logo=windows11&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-supported-000000?logo=apple&logoColor=white)
-![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white)
-![rclone](https://img.shields.io/badge/rclone-Google%20Drive%20%7C%20B2-3B3B3B?logo=rclone&logoColor=white)
 
-A desktop app for migrating files from flash drives and external storage to a local folder, Google Drive, or Backblaze B2 — **on Mac or Windows, from one shared codebase.** Processes multiple drives in parallel with a configurable concurrency limit, deduplicates by MD5 hash across all drives *and* machines, resumes safely after interruptions, and uploads to cloud destinations in batches via rclone.
-
----
-
-## Supported platforms
-
-| Platform | Status | Notes |
-|---|---|---|
-| **Windows 10 / 11** | ✅ Supported | Drive metadata via built-in PowerShell cmdlets, no admin rights needed |
-| **macOS** | ✅ Supported | Drive metadata via `diskutil`/`system_profiler`, Time Machine snapshot handling |
-| **Linux** | ⚠️ Untested | Core logic is platform-guarded and should run, but drive metadata falls back to basics |
-
-Both the Windows `.exe` and the macOS `.app` are built automatically from the **same `nas_migrate_gui.py`** by the CI workflow above — see [Download prebuilt builds](#download-prebuilt-builds).
-
----
-
-## Features
-
-- **Multi-drive parallel processing** — Connect multiple drives at once. Each drive gets its own worker thread. A configurable concurrency limit (default: 3) controls how many run simultaneously.
-- **Hot-swap** — Add new drives mid-run. They start automatically without interrupting drives already in progress.
-- **Deduplication** — MD5 hash computed during the copy pass (single read from source). Duplicates are skipped regardless of filename. The hash is registered in memory the moment a file is staged — other drives catch it as a dupe immediately, before the upload even confirms.
-- **Multi-machine dedup sync (B2)** — Run the app on a Mac and a Windows machine at the same time, both migrating to the same B2 bucket. Each machine pushes its hash registry to the bucket after every confirmed batch and pulls the other machine's registry on startup, so neither re-uploads what the other already has.
-- **Collision-safe naming** — Files are prefixed with the volume name (spaces removed) before staging. `photo.jpg` from two different drives becomes `DriveA_photo.jpg` and `DriveB_photo.jpg`. A per-drive name registry tracks every filename used across all batches in a run, so the same name can never appear twice in B2 regardless of how many batches flush.
-- **Windows-safe filenames** — Source drives (exFAT/HFS+/APFS) can contain filenames or volume labels with characters that are illegal on NTFS (`: * ? " < > |`). These are automatically sanitized before staging on Windows so a migration never crashes partway through on a bad filename.
-- **Resume** — If a run is interrupted, restart and choose Resume. Already-confirmed files are skipped instantly. The hash registry is always preserved across sessions.
-- **Write integrity check** — After each file is copied to staging, the staged file size is verified against bytes read from source. Silent write failures are caught and logged as errors immediately.
-- **Backblaze B2 via rclone** — Credentials entered in-app (no pre-configured rclone remote required). Uploads use `--checksum` so files already in B2 with a matching MD5 are never re-uploaded. Windows can auto-install rclone via `winget` with one click if it's missing.
-- **Google Drive via rclone** — Uploads via a configured rclone remote in batches.
-- **Automatic rclone retry** — Failed batches are retried up to 3 times with 30s/60s backoff. Staging dirs are preserved on failure so files can be retried from source on next run.
-- **Safe abort** — Pressing ABORT kills the in-flight rclone process immediately. Unconfirmed files are not marked done and will be retried from source on next run.
-- **Staged data counter** — A live indicator shows how many GB are currently staged locally and waiting to upload, updated every 5 seconds.
-- **Push notifications via ntfy** — Optional ntfy.sh topic for start, completion, first error, and drive-disconnect events. Topic is saved between sessions.
-- **Junk filter** — Skips macOS/Windows system files, tiny images (< 10 KB), `.app` bundles, executables and installers, software documentation, temp files, and build artifacts. Only recognized document/photo types are ever migrated — everything else is explicitly skipped, never silently miscategorized.
-- **Orphan cleanup** — Leftover staging folders from crashed runs are removed on startup.
+Point it at a pile of external drives and it moves everything worth keeping into one place — a local folder, Google Drive, or Backblaze B2. Multiple drives run in parallel, every file is deduplicated by content hash so the same photo on five drives uploads once, and interrupted runs resume where they left off. Runs on Mac and Windows — even both at once against the same bucket, sharing one dedup registry.
 
 ---
 
 ## Install
 
-The easiest way to get Shinigami Eyes — no Python, no source, no build step:
+Grab the latest from the [Releases page](https://github.com/r41n403/shinigami-eyes/releases/latest):
 
-1. Go to the [Releases page](https://github.com/r41n403/shinigami-eyes/releases/latest).
-2. Download the asset for your platform:
-   - **Windows:** `Shinigami Eyes-Windows.exe`
-   - **macOS:** `Shinigami Eyes-macOS.zip` (unzip it, then drag `Shinigami Eyes.app` wherever you like — Applications, Desktop, etc.)
-3. Run it. Both builds are code-signed and notarized (Windows via Azure Artifact Signing, macOS via a Developer ID certificate + Apple notarization), so there's no SmartScreen or Gatekeeper warning to click through.
+- **macOS** — download `Shinigami Eyes-macOS.dmg`, open it, drag the app to Applications.
+- **Windows** — download `Shinigami Eyes-Windows.exe` and run it.
 
-That's it — no dependencies to install for end users. Python, PyInstaller, and rclone are only needed if you're running from source (see [Setup from source](#setup-from-source) below).
+Both are code-signed and notarized — no security warnings, no dependencies to install. The app checks for updates on launch and offers a one-click download when a new version is out.
 
-## Download prebuilt builds
-
-Every push to `main` builds fresh Windows and macOS executables via GitHub Actions from the same source — see the [Actions tab](https://github.com/r41n403/shinigami-eyes/actions/workflows/build-executables.yml) for the latest run, or the [Releases page](https://github.com/r41n403/shinigami-eyes/releases) for tagged versions (`v*.*.*`) with both builds attached.
-
----
-
-## Requirements
-
-| | Windows | macOS |
-|---|---|---|
-| OS | Windows 10 or later | macOS (any recent version) |
-| Python | [python.org](https://www.python.org/downloads/) installer (tkinter included by default) | `brew install python-tk` or `brew install python` |
-| rclone (for Google Drive / B2) | Auto-installable in-app via `winget`, or [rclone.org/downloads](https://rclone.org/downloads/) | `brew install rclone` |
-
----
-
-## Setup from source
-
-### Windows
-```powershell
-python nas_migrate_gui.py
-```
-Or build a standalone `.exe` (the `--add-data` flag bundles the logo so the built exe shows it too):
-```powershell
-pip install pyinstaller
-pyinstaller --onefile --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
-```
-The executable lands in `dist\Shinigami Eyes.exe`.
-
-### macOS
-```bash
-python3 nas_migrate_gui.py
-```
-Or build a standalone `.app`:
-```bash
-pip3 install pyinstaller
-pyinstaller --windowed --name "Shinigami Eyes" --add-data "shinigami_eyes_logo.png:." nas_migrate_gui.py
-```
-The bundle lands in `dist/Shinigami Eyes.app`. (On a Homebrew Python install, `pip3 install` may need `--break-system-packages`.)
-
-### Or use the provided `.spec` file
-
-`Shinigami Eyes.spec` already has the logo wired into `datas=[]`, so a plain PyInstaller invocation works on either platform without typing out `--add-data`:
-```bash
-pyinstaller "Shinigami Eyes.spec"
-```
-
-### Configuring rclone (Google Drive)
-
-```bash
-rclone config
-```
-- Choose `n` → new remote
-- Name it (e.g. `gdrive`)
-- Type: `drive`
-- Leave client ID and secret blank, scope `1` (full access)
-- Follow the browser auth flow
-
-Enter that remote name in the app's **Remote name** field.
-
-**For Backblaze B2**, no rclone remote needed — enter Key ID, App Key, and bucket name directly in the app.
+For cloud destinations the app uses [rclone](https://rclone.org): `brew install rclone` on Mac; on Windows the app offers to install it for you.
 
 ---
 
 ## Usage
 
-1. **Add drives** — Click **Add Drives** and select one or more volumes (drive letters on Windows, `/Volumes` entries on Mac). Drive metadata (size, serial, bus type) is shown per row.
-2. **Destination** — Choose a mode:
-   - **Local folder** — pick an output directory
-   - **Google Drive** — select your rclone remote and set a subfolder name
-   - **Backblaze B2** — enter Key ID, App Key, bucket name, and optional subfolder
-3. **Max parallel** — Number of drives to process simultaneously (default: 3).
-4. **ntfy topic** — Optional. Enter an ntfy.sh topic for push notifications. Saved between sessions.
-5. **Execute** — Workers start. Each drive row shows live stats: copied, dupes, skipped, errors, and bytes.
-6. **Resume** — If a previous run exists for the same source + destination pair, the app asks whether to resume or start fresh.
-7. **Hot-add** — Click **Add Drives** at any time during a run to add more drives.
-8. **Abort** — Stops all workers and kills the in-flight rclone upload immediately.
+1. **Add Drives** — select one or more connected drives.
+2. **Pick a destination** — local folder, Google Drive, or Backblaze B2 (enter Key ID, App Key, and bucket right in the app).
+3. **Execute** — each drive shows live progress: copied, dupes, skipped, errors.
+4. Add more drives mid-run any time. **Abort** stops safely — nothing is marked done that didn't finish, and the next run resumes automatically.
 
----
-
-## Multi-machine setup (B2)
-
-Running Shinigami Eyes on a Mac and a Windows machine at the same time, both uploading to the same B2 bucket:
-
-1. Enter the **same bucket, Key ID, and App Key** in the B2 panel on both machines.
-2. Each machine gets a stable, random machine ID (saved in `config.json`) and pushes its hash database to `<bucket>/.shinigami_eyes/hashes_<machine_id>.db` after every confirmed upload batch.
-3. On startup, each machine pulls every *other* machine's hash database and merges it in — both in memory and into its own local SQLite copy — so a file one machine already uploaded is recognized and skipped by the other.
-
-This is eventually-consistent, not real-time: a machine only pulls at the *start* of a run, not continuously during one. If both machines happen to stage the same file before either has pulled the other's hashes, rclone's `--checksum` flag still catches it as already present in B2 and skips the redundant upload — nothing gets double-stored, you just don't get the instant in-memory skip mid-run.
-
----
-
-## Output Structure
+Everything lands sorted into two folders, with filenames prefixed by the drive they came from:
 
 ```
 Destination/
-├── Documents/    # pdf, docx, xlsx, pptx, txt, zip, mp4, mp3, psd, etc.
-└── Photos/       # jpg, png, heic, gif, bmp, tiff, webp, raw, dng, cr2, svg, etc.
+├── Documents/    ← pdf, docx, xlsx, txt, zip, video, audio, …
+│     ClientDrive_invoice.pdf
+└── Photos/       ← jpg, png, heic, and ~90 formats incl. RAW (arw, nef, dng, …)
+      MyDrive_IMG_0001.jpg
 ```
 
-Files are prefixed with the source volume name (spaces stripped, illegal characters replaced with `_` on Windows):
-
-```
-Photos/
-├── MyDrive_photo.jpg
-├── ClientDrive_photo.jpg       ← same filename, different drive, no collision
-├── MyDrive_IMG_0001.jpg
-├── MyDrive_IMG_0001_1.jpg      ← same name, same drive, different folder
-```
-
-Files that don't match a recognized document or photo extension (executables, installers, system files, etc.) are skipped entirely rather than being copied.
+Junk never makes the trip: system files, caches, app installers, tiny thumbnail images, and anything without a recognized document/photo extension are skipped — with a per-drive summary of what was skipped and why.
 
 ---
 
-## Cloud Batch Behavior
+## What makes it safe
 
-Files are staged locally (`%TEMP%\se_stage_*\` on Windows, `/tmp/se_stage_*/` on Mac) in up to 10 GB batches. When a batch fills, it's handed to the upload queue and the worker immediately starts filling the next batch — reads and uploads run in parallel.
+- **Content-hash dedup** — files are identified by MD5, not filename. Already-migrated files are skipped instantly, across every drive, run, and machine.
+- **Nothing is confirmed until it's really uploaded** — a file only counts as done after rclone verifies it in the cloud (checksum-matched). Abort or crash mid-run and it's retried next time.
+- **Write integrity check** — every staged copy is size-verified against the source.
+- **Failed uploads retry automatically** — 3 attempts with backoff; still-failed files retry from source on the next run.
 
-rclone uploads with `--checksum`, so files already in B2/Drive with a matching MD5 are skipped rather than re-uploaded. If rclone fails, the batch retries up to 3 times with backoff. If all retries fail, the staging folder is preserved and the files will be retried from source on next resume.
+## Two machines, one bucket
 
-Files are only confirmed (added to SQLite and the progress file) after rclone exits 0. Their hashes are added to the in-memory dedup set the moment they're staged, so other drives — and other machines, once synced — skip them immediately.
-
----
-
-## State Files
-
-All state is stored locally — never on the cloud destination.
-
-| File | Location | Purpose |
-|------|----------|---------|
-| `hashes.db` | `~/.shinigami_eyes/` (`%USERPROFILE%\.shinigami_eyes\` on Windows) | SQLite — persistent MD5 hash registry across all runs, drives, and synced machines |
-| `progress_<hash>.db` | same | Per source+destination record of confirmed source paths (enables resume) |
-| `b2_config.json` | same | Saved B2 credentials (Key ID, App Key, bucket, subfolder) |
-| `config.json` | same | App settings (ntfy topic, machine ID for multi-machine sync) |
-
-To wipe all dedup history and resume state:
-```bash
-rm -rf ~/.shinigami_eyes/          # macOS
-```
-```powershell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.shinigami_eyes\"   # Windows
-```
-
-To clear resume state for one drive+destination pair only, delete its `progress_*.db` file.
+Run the app on a Mac and a Windows machine at the same time, pointed at the same B2 bucket with the same credentials. Each machine publishes its hash registry to the bucket and pulls the other's on startup, so neither re-uploads what the other already handled. (Sync happens at run start — mid-run overlaps are still caught by rclone's checksum check, so nothing gets double-stored.)
 
 ---
 
-## Troubleshooting
+## Handy to know
 
-**B2 auth fails**
-```bash
-rclone lsd :b2: --b2-account=<key_id> --b2-key=<app_key>
-```
-The key must have read/write access to the specified bucket.
-
-**Multi-machine sync not finding the other machine's hashes**
-Confirm both machines are using the *exact same bucket name*. The app logs `Found N hash DB(s) in B2` on startup when B2 mode is active — if that shows 0 from other machines, verify the other machine has actually completed at least one confirmed batch (the push happens after batch confirmation, not before).
-
-**Drive shows "aborted" after a run was stopped**
-Expected — add the drive again and Execute. It will resume from confirmed files.
-
-**Leftover staging folders filling disk**
-Cleaned on startup automatically. To remove manually:
-```bash
-rm -rf /tmp/se_stage_*/                                  # macOS
-Remove-Item -Recurse -Force "$env:TEMP\se_stage_*"        # Windows (PowerShell)
-```
-
-**Too many false duplicates**
-The hash registry persists forever by design. To force a file to be re-copied, delete `hashes.db` (affects all drives/machines) or the relevant `progress_*.db` (affects one source+destination pair only).
-
-**macOS: "asks for permission to access drives on first launch"**
-Accept all permission prompts. The app waits up to ~12 seconds for a volume to remount after a TCC permission dialog before concluding it was disconnected.
-
-**Windows: drive metadata shows "?" for manufacturer/serial**
-Pulled via PowerShell's `Get-PhysicalDisk`/`Get-Disk`, which requires the drive to be exposed as a normal physical disk — some USB card readers and RAID enclosures don't report this. Doesn't affect migration, only the informational display.
+- **State lives in `~/.shinigami_eyes/`** (`%USERPROFILE%\.shinigami_eyes\` on Windows). Delete the folder to reset all dedup/resume history.
+- **Optional push notifications** — enter an [ntfy.sh](https://ntfy.sh) topic to get notified on completion, errors, or drive disconnects.
+- **macOS permission prompts** — accept them on first launch; the app waits out the brief volume remount they cause.
+- **Time Machine drives** (macOS) — APFS snapshots are detected and mounted automatically so backup contents get migrated too.
 
 ---
 
-## CI / Building both platforms
-
-[`.github/workflows/build-executables.yml`](.github/workflows/build-executables.yml) builds both platforms from the single `nas_migrate_gui.py` on every push to `main`:
-
-- **Windows** — `actions/setup-python` + PyInstaller → `Shinigami Eyes.exe`, then signed via **Azure Artifact Signing** (OIDC login, no stored secret)
-- **macOS** — Homebrew's `python-tk` (GitHub's hosted macOS Python doesn't include tkinter) + PyInstaller → `Shinigami Eyes.app`, then signed with a **Developer ID Application** certificate, notarized via `notarytool`, and stapled, before being zipped via `ditto`
-- Both builds bundle `shinigami_eyes_logo.png` via `--add-data` so the frozen executable shows the same logo as running from source
-- Trigger paths cover `nas_migrate_gui.py`, `shinigami_eyes_logo.png`, and the workflow file itself — a logo-only change rebuilds too
-
-Pushing a version tag (`git tag v3.0.0 && git push --tags`) additionally publishes a GitHub Release (requires `contents: write`, already configured) with both builds attached as downloadable assets.
-
----
-
-## Testing
-
-[`tests/test_build_workflow.py`](tests/test_build_workflow.py) is a unit test suite for the CI workflow itself — it parses `build-executables.yml` and checks things a hand-edited YAML file can easily get wrong: matrix/artifact-name consistency, the platform-specific `--add-data` separator (`;` on Windows, `:` elsewhere), `--onefile` only being set on Windows, and the release job's file list actually matching what the package steps produce.
+## Running from source
 
 ```bash
-pip install -r tests/requirements.txt
-python3 -m unittest discover -s tests
+# macOS (needs brew install python-tk rclone)
+python3 nas_migrate_gui.py
+
+# Windows (python.org Python includes tkinter)
+python nas_migrate_gui.py
 ```
 
----
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `nas_migrate_gui.py` | Main application — Python/tkinter GUI, runs on both Mac and Windows |
-| `shinigami_eyes_logo.png` | App logo/wordmark, shown in the running app and bundled into both builds via PyInstaller `--add-data` |
-| `Shinigami Eyes.spec` | PyInstaller build spec with the logo already wired into `datas=[]` — alternative to the CLI flags above |
-| `.github/workflows/build-executables.yml` | CI: builds Windows `.exe` and macOS `.app` on every push, publishes releases on version tags |
-| `tests/` | Unit tests validating the CI workflow's structure (see [Testing](#testing)) |
+Everything is one file: `nas_migrate_gui.py`. Prebuilt executables for both platforms are compiled from it automatically by [CI](.github/workflows/build-executables.yml) — publishing a GitHub Release builds, signs, notarizes, and attaches both installers. The workflow itself is covered by unit tests (`python3 -m unittest discover -s tests`).
