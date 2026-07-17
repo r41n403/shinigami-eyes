@@ -65,10 +65,13 @@ jobs:
           import re, sys, pathlib
           tag = sys.argv[1]
           p = pathlib.Path('nas_migrate_gui.py')
+          # encoding must be explicit: Windows Python defaults to cp1252,
+          # which can't decode this file's UTF-8 box-drawing characters
           src, n = re.subn(r"^VERSION(\s*)=\s*'[^']*'",
-                           rf"VERSION\g<1>= '{tag}'", p.read_text(), count=1, flags=re.M)
+                           rf"VERSION\g<1>= '{tag}'",
+                           p.read_text(encoding='utf-8'), count=1, flags=re.M)
           assert n == 1, 'VERSION constant not found'
-          p.write_text(src)
+          p.write_text(src, encoding='utf-8')
           EOF
           grep -m1 "^VERSION" nas_migrate_gui.py
 
