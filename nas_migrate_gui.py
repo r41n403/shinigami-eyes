@@ -1909,8 +1909,38 @@ class MigrationApp(tk.Tk):
                                showhandle=True, handlesize=24, handlepad=12)
         paned.pack(fill='both', expand=True)
 
-        outer = tk.Frame(paned, bg=BG, padx=24, pady=16)
-        paned.add(outer, stretch='always', minsize=400)
+        # The controls pane is a scrollable canvas: its content can outgrow
+        # the pane (update banner, B2 credential fields, long drive lists),
+        # and PanedWindow just clips overflow — the Execute button became
+        # unreachable once. Scrolling keeps everything accessible at any size.
+        ctrl_container = tk.Frame(paned, bg=BG)
+        paned.add(ctrl_container, stretch='always', minsize=300)
+
+        ctrl_canvas = tk.Canvas(ctrl_container, bg=BG, highlightthickness=0)
+        ctrl_vsb = ttk.Scrollbar(ctrl_container, orient='vertical',
+                                 command=ctrl_canvas.yview)
+        outer = tk.Frame(ctrl_canvas, bg=BG, padx=24, pady=16)
+        ctrl_win = ctrl_canvas.create_window((0, 0), window=outer, anchor='nw')
+
+        def _sync_scrollregion(e=None):
+            ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox('all'))
+        outer.bind('<Configure>', _sync_scrollregion)
+        ctrl_canvas.bind('<Configure>',
+                         lambda e: ctrl_canvas.itemconfig(ctrl_win, width=e.width))
+        ctrl_canvas.configure(yscrollcommand=ctrl_vsb.set)
+        ctrl_canvas.pack(side='left', fill='both', expand=True)
+        ctrl_vsb.pack(side='right', fill='y')
+
+        # Mouse wheel scrolls the controls pane while the pointer is over it;
+        # unbound on leave so the log box keeps its own native scrolling.
+        def _on_wheel(e):
+            delta = -e.delta if IS_MAC else -e.delta // 120
+            ctrl_canvas.yview_scroll(int(delta), 'units')
+        ctrl_canvas.bind('<Enter>',
+                         lambda e: ctrl_canvas.bind_all('<MouseWheel>', _on_wheel))
+        ctrl_canvas.bind('<Leave>',
+                         lambda e: ctrl_canvas.unbind_all('<MouseWheel>'))
+
         self._outer = outer   # update banner inserts itself at the top of this
 
         # NB: Frame padx/pady must be single values — tuple (top, bottom)
