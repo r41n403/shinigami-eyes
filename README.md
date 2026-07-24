@@ -59,6 +59,12 @@ Junk never makes the trip: system files, caches, app installers, tiny thumbnail 
 
 Run the app on a Mac and a Windows machine at the same time, pointed at the same B2 bucket with the same credentials. Each machine publishes its hash registry to the bucket and pulls the other's on startup, so neither re-uploads what the other already handled. (Sync happens at run start — mid-run overlaps are still caught by rclone's checksum check, so nothing gets double-stored.)
 
+## Import from Google Drive
+
+**☁ Import from Google Drive** (next to Add Drives) pulls a folder straight from a Google Drive rclone remote into Backblaze B2 — no local staging drive required, and only usable when the destination is set to B2.
+
+It goes through the exact same dedup registry as physical drives: Google's own stored checksum is checked against already-migrated hashes before anything downloads, so known duplicates cost zero bandwidth. Google Docs, Sheets, Slides, and Drawings — which have no fixed binary form to hash — are exported to PDF/XLSX/PPTX/SVG first, then hashed and deduped the same way as everything else (so a Doc that happens to export to bytes identical to something already migrated is still caught). Files with no export target (Forms, Sites, Apps Script, etc.) are skipped and reported in the summary, same as any other unsupported file type.
+
 ---
 
 ## Handy to know

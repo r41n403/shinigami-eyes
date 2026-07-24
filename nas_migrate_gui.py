@@ -840,6 +840,122 @@ def find_gdrive() -> str:
     return ''
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GOOGLE DRIVE IMPORT  — Google Drive folder → B2, through the SAME dedup/
+# upload pipeline as physical drives (HashRegistry, UploadCoordinator, batching)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Native Google Docs/Sheets/Slides/Drawings have no fixed binary form and no
+# MD5 from the API — they only get one once exported. Maps each exportable
+# mimeType to the rclone --drive-export-formats value and resulting extension.
+# Forms, Sites, Apps Script, Jamboard, My Maps etc. have no good universal
+# export target and are skipped (reported in the per-import skip summary).
+GOOGLE_NATIVE_EXPORT = {
+    'application/vnd.google-apps.document':     ('pdf',  '.pdf'),
+    'application/vnd.google-apps.spreadsheet':  ('xlsx', '.xlsx'),
+    'application/vnd.google-apps.presentation': ('pptx', '.pptx'),
+    'application/vnd.google-apps.drawing':      ('svg',  '.svg'),
+}
+
+
+def list_gdrive_entries(rclone_path: str, remote: str, folder: str,
+                        log_fn=None) -> Optional[list[dict]]:
+    """Enumerate every file under a Google Drive folder via `rclone lsjson
+    --hash`. Regular (non-Google-native) files come back with Google's own
+    stored MD5 at zero transfer cost — that's what lets known duplicates be
+    skipped without ever downloading them. Native Google Docs/Sheets/Slides
+    have no fixed binary form, so their 'md5' is None here; they can only be
+    hashed after being exported (see download_gdrive_file).
+
+    Returns None on failure (bad remote name, folder not found, network
+    error, etc.) — the caller must treat that as a fatal error for this
+    import, not an empty folder."""
+    log = log_fn or (lambda msg, tag='': None)
+    remote_path = f'{remote}:{folder}'.rstrip('/') if folder else f'{remote}:'
+    try:
+        r = subprocess.run(
+            [rclone_path, 'lsjson', '--recursive', '--files-only', '--hash', remote_path],
+            capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            log(f'  ERR  rclone lsjson failed: {r.stderr.strip()[:300]}', 'err')
+            return None
+        raw = json.loads(r.stdout)
+    except subprocess.TimeoutExpired:
+        log('  ERR  rclone lsjson timed out — very large folder?', 'err')
+        return None
+    except Exception as e:
+        log(f'  ERR  could not list Google Drive folder: {e}', 'err')
+        return None
+
+    entries = []
+    for item in raw:
+        hashes = item.get('Hashes') or {}
+        md5 = hashes.get('md5') or hashes.get('MD5') or hashes.get('MD5SUM')
+        entries.append({
+            'path':      item.get('Path', item.get('Name', '')),
+            'name':      item.get('Name', ''),
+            'size':      int(item.get('Size', 0) or 0),
+            'mime_type': item.get('MimeType', ''),
+            'md5':       md5,
+        })
+    return entries
+
+
+def download_gdrive_file(rclone_path: str, remote: str, folder: str, entry: dict,
+                         work_root: str) -> tuple[str, str, int, str, str]:
+    """Download one file from a Google Drive remote, exporting native Google
+    Docs/Sheets/Slides/Drawings to a standard format via rclone's
+    --drive-export-formats along the way. Downloads into a private temp
+    subdirectory rather than a predicted filename, since rclone's exact
+    export-filename behavior (whether/how it appends the export extension)
+    isn't something to hard-code against — we just look at what it actually
+    produced.
+
+    entry['path'] comes from list_gdrive_entries()'s `rclone lsjson
+    --recursive`, which reports paths relative to the queried root
+    (remote:folder) — not relative to the remote's own root. folder must be
+    re-prefixed here or rclone looks for the file at the Drive root and
+    fails with 'directory not found'.
+
+    Returns (md5_hex, local_tmp_path, bytes_written, effective_filename,
+    work_dir). Caller must shutil.rmtree(work_dir) when done with the file
+    (whether it's used or discarded as a dupe found after download).
+    Raises RuntimeError on failure."""
+    export = GOOGLE_NATIVE_EXPORT.get(entry['mime_type'])
+    extra_args = ['--drive-export-formats', export[0]] if export else []
+
+    work_dir = tempfile.mkdtemp(dir=work_root, prefix='.se_gdl_')
+    base = f'{remote}:{folder}'.rstrip('/') if folder else f'{remote}:'
+    sep = '/' if folder else ''
+    src_remote_path = f'{base}{sep}{entry["path"]}'
+    cmd = [rclone_path, 'copy', src_remote_path, work_dir] + extra_args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise RuntimeError('download timed out after 10 minutes')
+
+    produced = os.listdir(work_dir)
+    if r.returncode != 0 or not produced:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise RuntimeError((r.stderr or 'rclone copy produced no file').strip()[:300])
+
+    downloaded_name = produced[0]
+    downloaded_path = os.path.join(work_dir, downloaded_name)
+
+    try:
+        h = hashlib.md5(usedforsecurity=False)   # required on some macOS/Python builds
+    except TypeError:
+        h = hashlib.md5()                        # older Python without the flag
+    written = 0
+    with open(downloaded_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(CHUNK), b''):
+            h.update(chunk)
+            written += len(chunk)
+
+    return h.hexdigest(), downloaded_path, written, downloaded_name, work_dir
+
+
 def load_b2_config() -> dict:
     try:
         with open(B2_CONFIG_FILE) as f:
@@ -1717,6 +1833,301 @@ class DriveWorker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GDRIVE IMPORT WORKER  — Google Drive folder → B2, same dedup/upload pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GDriveImportWorker:
+    """Imports a Google Drive folder into the exact same HashRegistry /
+    UploadCoordinator pipeline used for physical drives.
+
+    Source enumeration is `rclone lsjson --hash` once up front, which
+    returns Google's own stored MD5 for regular files at zero transfer cost
+    — known duplicates are skipped without ever being downloaded. Files with
+    no pre-known hash (native Google Docs/Sheets/Slides/Drawings, which have
+    no fixed binary form) are downloaded via rclone with
+    --drive-export-formats and hashed locally, then checked against the
+    SAME registry as everything else — so a Doc that exports to identical
+    PDF bytes as one already migrated from a physical drive is caught as a
+    duplicate too, not just against other Drive files.
+
+    Deliberately NOT a subclass of DriveWorker — the two share almost no
+    code (a remote API listing vs. a local os.walk) beyond the staging/
+    batching/upload pattern, which is small enough to duplicate here rather
+    than risk refactoring the heavily-used DriveWorker class. Only usable
+    with a Backblaze B2 destination — enforced by the caller, not here."""
+
+    def __init__(
+        self, *,
+        remote: str, folder: str, output_path: str, info: DriveInfo,
+        registry: HashRegistry, coordinator: UploadCoordinator,
+        rclone_path: str, gd_subfolder: str = '',
+        b2_key_id='', b2_app_key='', b2_bucket='',
+        log_fn=print, on_done=None, on_progress=None,
+        ntfy_topic='', resume=False,
+        running_ref: Callable = lambda: True,
+        batch_limit: int = BATCH_LIMIT_BYTES,
+    ):
+        self.remote       = remote
+        self.folder       = folder
+        # Encoded so progress_file_for() derives the same resume key here as
+        # the pre-flight resume check in _start() (which hashes info.path).
+        self.src          = f'gdrive-import://{remote}:{folder}'
+        self.out          = output_path
+        self.info         = info
+        self.registry     = registry
+        self.coordinator  = coordinator
+        self.rclone_path  = rclone_path
+        self.gd_subfolder = gd_subfolder
+        self.b2_key_id    = b2_key_id
+        self.b2_app_key   = b2_app_key
+        self.b2_bucket    = b2_bucket
+        self._log         = log_fn
+        self._on_done        = on_done or (lambda s: None)
+        self._on_progress_cb = on_progress or (lambda s: None)
+        self.ntfy_topic   = ntfy_topic
+        self.resume       = resume
+        self._running     = running_ref
+        self.batch_limit  = batch_limit
+        self.stats        = DriveStats(label=info.label_or_name)
+        self._active      = False
+        self._last_progress_t = 0.0
+
+    def is_alive(self): return self._active
+
+    def _on_progress(self, s: DriveStats):
+        now = time.monotonic()
+        if now - self._last_progress_t < 1.0:
+            return
+        self._last_progress_t = now
+        self._on_progress_cb(s)
+
+    def _run(self):
+        self._active      = True
+        self.stats.status = 'running'
+        try:
+            self._migrate()
+        except Exception as e:
+            self.stats.fatal  = str(e)
+            self.stats.status = 'error'
+            self._log(f'  [{self.info.label_or_name}] FATAL: {e}', 'err')
+        finally:
+            self._active = False
+            if not self.stats.fatal:
+                self.stats.status = 'done' if self._running() else 'aborted'
+            self._on_done(self.stats)
+
+    @staticmethod
+    def _new_stage(label: str) -> dict:
+        d      = tempfile.mkdtemp(prefix=f'se_stage_{sanitize_for_windows(label)[:8]}_')
+        docs   = os.path.join(d, 'Documents')
+        photos = os.path.join(d, 'Photos')
+        os.makedirs(docs,   exist_ok=True)
+        os.makedirs(photos, exist_ok=True)
+        return {'dir': d, 'docs': docs, 'photos': photos}
+
+    def _migrate(self):
+        label         = self.info.label_or_name
+        progress_path = progress_file_for(self.out, self.src)
+        s             = self.stats
+
+        vol_prefix = sanitize_for_windows(re.sub(r'\s+', '', label)) + '_'
+        _used_names: dict[str, set[str]] = {'Documents': set(), 'Photos': set()}
+
+        def unique_staged_name(category: str, filename: str) -> str:
+            filename = sanitize_for_windows(filename)
+            used = _used_names[category]
+            base, ext = os.path.splitext(filename)
+            candidate = filename
+            counter = 1
+            while candidate in used:
+                candidate = f'{base}_{counter}{ext}'
+                counter += 1
+            used.add(candidate)
+            return candidate
+
+        # ── Resume set ────────────────────────────────────────────────────────
+        processed: set[str] = set()
+        if self.resume and progress_path.exists():
+            try:
+                with open(progress_path) as f:
+                    for line in f:
+                        p = line.strip()
+                        if p: processed.add(p)
+                self._log(f'  [{label}] Resuming — {len(processed):,} already done')
+            except Exception:
+                pass
+
+        stage = self._new_stage(label)
+        pending: list[tuple[str, str]] = []
+        batch_bytes = 0
+
+        def flush():
+            nonlocal batch_bytes, stage
+            if not pending: return
+            s.batches += 1
+            n = s.batches
+            job_pending = list(pending)
+            pending.clear()
+            batch_bytes = 0
+            old_stage = stage
+            stage = self._new_stage(label)
+
+            job = UploadJob(
+                stage_dir=old_stage['dir'], pending=job_pending,
+                progress_path=progress_path, drive_label=label, batch_num=n,
+                use_b2=True, b2_key_id=self.b2_key_id,
+                b2_app_key=self.b2_app_key, b2_bucket=self.b2_bucket,
+                use_rclone=False, rclone_path=self.rclone_path,
+                rclone_remote='', gd_subfolder=self.gd_subfolder,
+            )
+            self._log(f'  [{label}] ↑ Batch #{n} queued ({len(job_pending):,} files)', 'info')
+            self.coordinator.enqueue(job)
+            # Don't wait — keep reading. Disk back-pressure handles flow control.
+
+        # ── List source ──────────────────────────────────────────────────────
+        self._log(f'  [{label}] Listing Google Drive folder "{self.folder or "/"}"…', 'head')
+        send_ntfy(self.ntfy_topic, f'Started: {label} (Google Drive import)',
+                  title='Shinigami Eyes — Import Started')
+
+        entries = list_gdrive_entries(self.rclone_path, self.remote, self.folder,
+                                      log_fn=self._log)
+        if entries is None:
+            s.fatal = 'Could not list Google Drive folder — check the remote name and path'
+            self._log(f'  [{label}] ERR {s.fatal}', 'err')
+            return
+
+        files_seen = len(entries)
+        skip_reasons: dict[str, int] = {}
+        self._log(f'  [{label}] Found {files_seen:,} file(s)', 'info')
+
+        for entry in entries:
+            if not self._running(): break
+
+            resume_key = entry['path']
+            if resume_key in processed:
+                s.skipped_resume += 1
+                skip_reasons['already done (resume)'] = skip_reasons.get('already done (resume)', 0) + 1
+                self._on_progress(s)
+                continue
+
+            skip, reason = should_skip(entry['name'], entry['size'])
+            if skip:
+                s.skipped_sys += 1
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                self._on_progress(s)
+                continue
+
+            mime   = entry['mime_type']
+            export = GOOGLE_NATIVE_EXPORT.get(mime)
+            if mime.startswith('application/vnd.google-apps.') and not export:
+                s.skipped_sys += 1
+                skip_reasons['google-native (no export format)'] = skip_reasons.get(
+                    'google-native (no export format)', 0) + 1
+                self._on_progress(s)
+                continue
+
+            # Fast path: Google already gave us the MD5 for regular files —
+            # skip known duplicates with zero download.
+            known_hash = entry['md5']
+            if known_hash and self.registry.contains(known_hash):
+                s.skipped_dupe += 1
+                skip_reasons['duplicate (hash match)'] = skip_reasons.get('duplicate (hash match)', 0) + 1
+                self._on_progress(s)
+                continue
+
+            # Category from the (possibly export-mapped) extension
+            check_name = entry['name']
+            if export:
+                check_name = os.path.splitext(check_name)[0] + export[1]
+            ext = os.path.splitext(check_name)[1].lower()
+            if ext in DOC_EXTENSIONS:
+                category = 'Documents'
+            elif ext in IMAGE_EXTENSIONS:
+                category = 'Photos'
+            else:
+                s.skipped_sys += 1
+                skip_reasons['unrecognized extension'] = skip_reasons.get(
+                    'unrecognized extension', 0) + 1
+                self._on_progress(s)
+                continue
+
+            waited = False
+            while not _can_stage(entry['size']):
+                if not self._running(): return
+                if not waited:
+                    self._log(f'  [{label}] ⏳ Low disk — waiting for upload to free space…', 'warn')
+                    waited = True
+                time.sleep(15)
+
+            try:
+                h, local_path, written, dl_name, work_dir = download_gdrive_file(
+                    self.rclone_path, self.remote, self.folder, entry, tempfile.gettempdir())
+            except Exception as e:
+                s.errors += 1
+                self._log(f'  [{label}] ERR {entry["name"]}: {e}', 'err')
+                if s.errors == 1:
+                    send_ntfy(self.ntfy_topic, f'Error on {entry["name"]}: {e}',
+                              title=f'Shinigami Eyes — Error on {label}')
+                continue
+
+            # Second dedup check: catches native-doc exports whose content
+            # matches something already migrated, which had no pre-known
+            # hash to check before downloading.
+            if self.registry.contains(h):
+                s.skipped_dupe += 1
+                skip_reasons['duplicate (hash match)'] = skip_reasons.get('duplicate (hash match)', 0) + 1
+                self._on_progress(s)
+                shutil.rmtree(work_dir, ignore_errors=True)
+                continue
+
+            dest_dir    = stage['docs'] if category == 'Documents' else stage['photos']
+            final_fname = unique_staged_name(category, vol_prefix + dl_name)
+            dest        = os.path.join(dest_dir, final_fname)
+            try:
+                shutil.move(local_path, dest)
+            except Exception as e:
+                s.errors += 1
+                self._log(f'  [{label}] ERR move {dl_name}: {e}', 'err')
+                shutil.rmtree(work_dir, ignore_errors=True)
+                continue
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+            s.copied      += 1
+            s.bytes_copied += written
+            self._on_progress(s)
+
+            # Immediate in-memory registration — same pattern as DriveWorker:
+            # other workers (drives or imports) catch this as a dupe right
+            # away; SQLite write is deferred to _confirm() after upload.
+            self.registry._hashes.add(h)
+            pending.append((resume_key, h))
+            batch_bytes += written
+            if batch_bytes >= self.batch_limit:
+                flush()
+
+        if pending and self._running():
+            flush()
+
+        self.registry.flush()
+        if stage and os.path.exists(stage['dir']):
+            shutil.rmtree(stage['dir'], ignore_errors=True)
+
+        if files_seen == 0:
+            self._log(f'  [{label}] ⚠️  No files found in this folder', 'warn')
+        if skip_reasons:
+            reasons_str = '  ·  '.join(f'{v:,} {k}' for k, v in
+                                       sorted(skip_reasons.items(), key=lambda x: -x[1]))
+            self._log(f'  [{label}] ℹ️  {files_seen:,} seen · skipped: {reasons_str}', 'info')
+
+        summary = (f'{s.copied:,} copied · {s.skipped_dupe:,} dupes ·'
+                   f' {s.skipped_resume:,} resumed · {s.errors:,} errors ·'
+                   f' {_fmt_bytes(s.bytes_copied)}')
+        self._log(f'  [{label}] ✓ DONE — {summary}', 'ok')
+        send_ntfy(self.ntfy_topic, f'✅ {label} import complete.\n\n{summary}',
+                  title=f'Shinigami Eyes — Import {label} complete')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VOLUME PICKER DIALOG
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1816,6 +2227,109 @@ class VolumePicker(tk.Toplevel):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GOOGLE DRIVE IMPORT DIALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GDriveImportDialog(tk.Toplevel):
+    """Prompts for an rclone remote name + folder path to import from Google
+    Drive, and does a quick synchronous `rclone lsd` sanity check before
+    accepting — so a typo'd remote name or unreachable folder is caught here
+    rather than only surfacing once the run is already underway."""
+
+    def __init__(self, parent, rclone_path: str):
+        super().__init__(parent)
+        self.title('Import from Google Drive')
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.rclone_path = rclone_path
+        self.result: Optional[tuple[str, str]] = None   # (remote, folder)
+
+        tk.Label(self, text='Import from Google Drive',
+                 font=(MONO_FONT, 12, 'bold'), fg=GREEN, bg=BG
+                 ).pack(padx=20, pady=(16, 4))
+        tk.Label(self,
+                 text='Reads a folder from a Google Drive rclone remote and\n'
+                      'uploads it straight to Backblaze B2 — deduplicated\n'
+                      'against the same hash registry as physical drives.',
+                 font=(MONO_FONT, 9), fg=MUTED, bg=BG, justify='left'
+                 ).pack(padx=20, pady=(0, 12))
+
+        form = tk.Frame(self, bg=BG)
+        form.pack(padx=20, fill='x')
+
+        tk.Label(form, text='Remote:', font=(MONO_FONT, 10), fg=FG, bg=BG,
+                 width=10, anchor='e').grid(row=0, column=0, pady=4, sticky='e')
+        self.var_remote = tk.StringVar(value='gdrive')
+        tk.Entry(form, textvariable=self.var_remote, width=28,
+                 bg=SURFACE, fg=FG, insertbackground=GREEN,
+                 relief='flat', font=(MONO_FONT, 10)
+                 ).grid(row=0, column=1, pady=4, padx=(8, 0), sticky='w')
+
+        tk.Label(form, text='Folder:', font=(MONO_FONT, 10), fg=FG, bg=BG,
+                 width=10, anchor='e').grid(row=1, column=0, pady=4, sticky='e')
+        self.var_folder = tk.StringVar(value='')
+        tk.Entry(form, textvariable=self.var_folder, width=28,
+                 bg=SURFACE, fg=FG, insertbackground=GREEN,
+                 relief='flat', font=(MONO_FONT, 10)
+                 ).grid(row=1, column=1, pady=4, padx=(8, 0), sticky='w')
+        tk.Label(self, text='(leave Folder blank to import the whole remote)',
+                 font=(MONO_FONT, 8), fg=MUTED, bg=BG
+                 ).pack(padx=20, pady=(0, 8))
+
+        self._status_lbl = tk.Label(self, text='', font=(MONO_FONT, 9), bg=BG)
+        self._status_lbl.pack(padx=20, pady=(0, 4))
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=(8, 16))
+        self._add_btn = tk.Button(btn_row, text='Check & Add',
+                  font=(MONO_FONT, 11, 'bold'),
+                  bg=GREEN, fg='#000', activebackground='#d8a533',
+                  relief='flat', padx=14, pady=6, command=self._check_and_add)
+        self._add_btn.pack(side='left', padx=8)
+        tk.Button(btn_row, text='Cancel',
+                  font=(MONO_FONT, 11), bg=SURFACE, fg=GREEN,
+                  relief='flat', padx=14, pady=6,
+                  command=self.destroy).pack(side='left', padx=8)
+
+    def _check_and_add(self):
+        remote = self.var_remote.get().strip().rstrip(':')
+        folder = self.var_folder.get().strip().strip('/')
+        if not remote:
+            self._status_lbl.config(text='Enter a remote name', fg=RED)
+            return
+        if not self.rclone_path:
+            self._status_lbl.config(text='rclone not found', fg=RED)
+            return
+
+        self._add_btn.config(state='disabled')
+        self._status_lbl.config(text='Checking…', fg=MUTED)
+        self.update_idletasks()
+
+        remote_path = f'{remote}:{folder}' if folder else f'{remote}:'
+        try:
+            r = subprocess.run([self.rclone_path, 'lsd', remote_path],
+                               capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            self._status_lbl.config(text='Timed out — check the remote/folder', fg=RED)
+            self._add_btn.config(state='normal')
+            return
+        except Exception as e:
+            self._status_lbl.config(text=f'Error: {e}', fg=RED)
+            self._add_btn.config(state='normal')
+            return
+
+        if r.returncode != 0:
+            self._status_lbl.config(
+                text=(r.stderr.strip()[:80] or 'Could not reach that remote/folder'), fg=RED)
+            self._add_btn.config(state='normal')
+            return
+
+        self.result = (remote, folder)
+        self.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DRIVE ROW WIDGET
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1893,11 +2407,13 @@ class DriveRow(tk.Frame):
         self._icon_lbl.config(text=icon, fg=color)
 
         if stats.status == 'done':
+            is_import = self.info.path.startswith('gdrive-import://')
+            tail = 'IMPORT COMPLETE' if is_import else 'SAFE TO DISCONNECT'
             msg = (f'✓ DONE — {stats.copied:,} copied · '
                    f'{stats.skipped_dupe:,} dupes · '
                    f'{stats.errors:,} errors · '
                    f'{_fmt_bytes(stats.bytes_copied)}'
-                   f'  — SAFE TO DISCONNECT')
+                   f'  — {tail}')
             self._stats_lbl.config(text=msg, fg=color)
             self._icon_lbl.config(fg=RED)  # red X for done
         elif stats.status == 'aborted':
@@ -2098,6 +2614,13 @@ class MigrationApp(tk.Tk):
                   activebackground='#938f87', activeforeground=GREEN,
                   relief='flat', padx=14, pady=6, cursor='hand2',
                   command=self._add_drives).pack(side='left')
+
+        tk.Button(add_row, text='☁  Import from Google Drive',
+                  font=(MONO_FONT, 11, 'bold'),
+                  bg=SURFACE, fg=GREEN,
+                  activebackground='#938f87', activeforeground=GREEN,
+                  relief='flat', padx=14, pady=6, cursor='hand2',
+                  command=self._import_gdrive).pack(side='left', padx=(8, 0))
 
         # Max parallel
         tk.Label(add_row, text='Max parallel:',
@@ -2340,6 +2863,25 @@ class MigrationApp(tk.Tk):
         info = get_drive_info(path)
         self.after(0, lambda: self._add_drive_row(info))
 
+    def _import_gdrive(self):
+        if not self._rclone_path:
+            messagebox.showwarning('rclone required',
+                f'Importing from Google Drive needs rclone.\n\n{RCLONE_INSTALL_HINT}')
+            return
+        already = {info.path for _, info, _ in self._drives}
+        dlg = GDriveImportDialog(self, self._rclone_path)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        remote, folder = dlg.result
+        path = f'gdrive-import://{remote}:{folder}'
+        if path in already:
+            messagebox.showinfo('Already added', 'That Google Drive folder is already in the list.')
+            return
+        label = f'GDrive: {folder or remote}'
+        info = DriveInfo(path=path, label=label, fs_type='Google Drive (import)')
+        self._add_drive_row(info)
+
     def _add_drive_row(self, info: DriveInfo):
         row = DriveRow(
             self._drive_frame, info,
@@ -2376,6 +2918,16 @@ class MigrationApp(tk.Tk):
         mode       = self.var_mode.get()
         use_gdrive = (mode == 'gdrive')
         use_b2     = (mode == 'b2')
+
+        has_gdrive_import = any(info.path.startswith('gdrive-import://')
+                               for _, info, _ in self._drives)
+        if has_gdrive_import and not use_b2:
+            messagebox.showwarning(
+                'Backblaze B2 required',
+                'Google Drive imports upload directly to Backblaze B2 only.\n\n'
+                'Switch Destination to Backblaze B2, or remove the Google '
+                'Drive import from the source list.')
+            return
         use_rclone = False
         rclone_remote = ''
         gd_subfolder  = ''
@@ -2551,21 +3103,38 @@ class MigrationApp(tk.Tk):
         self.after(0, self._all_done)
 
     def _launch_worker(self, row: 'DriveRow', info: DriveInfo, resume: bool):
-        """Spawn a worker for one drive. Safe to call mid-run."""
+        """Spawn a worker for one drive OR one Google Drive import — dispatch
+        is by info.path prefix so the rest of the app (drive list, resume
+        dialogs, hot-add, progress display) never needs to know the
+        difference. Safe to call mid-run."""
         cfg = self._run_cfg
-        worker = DriveWorker(
-            source_path=info.path, output_path=cfg['output_path'], info=info,
-            registry=self._registry, coordinator=self._coordinator,
-            use_gdrive=cfg['use_gdrive'], use_rclone=cfg['use_rclone'],
-            use_b2=cfg['use_b2'], rclone_path=self._rclone_path or '',
-            rclone_remote=cfg['rclone_remote'], gd_subfolder=cfg['gd_subfolder'],
-            b2_key_id=cfg['b2_key_id'], b2_app_key=cfg['b2_app_key'],
-            b2_bucket=cfg['b2_bucket'], log_fn=self._log,
-            on_done=lambda s, r=row: self.after(0, lambda: self._drive_done(r, s)),
-            on_progress=lambda s, r=row: self._on_progress_throttled(r, s),
-            ntfy_topic=cfg['ntfy_topic'], resume=resume,
-            running_ref=lambda: self._running,
-        )
+        if info.path.startswith('gdrive-import://'):
+            remote, folder = info.path[len('gdrive-import://'):].split(':', 1)
+            worker = GDriveImportWorker(
+                remote=remote, folder=folder, output_path=cfg['output_path'], info=info,
+                registry=self._registry, coordinator=self._coordinator,
+                rclone_path=self._rclone_path or '', gd_subfolder=cfg['gd_subfolder'],
+                b2_key_id=cfg['b2_key_id'], b2_app_key=cfg['b2_app_key'],
+                b2_bucket=cfg['b2_bucket'], log_fn=self._log,
+                on_done=lambda s, r=row: self.after(0, lambda: self._drive_done(r, s)),
+                on_progress=lambda s, r=row: self._on_progress_throttled(r, s),
+                ntfy_topic=cfg['ntfy_topic'], resume=resume,
+                running_ref=lambda: self._running,
+            )
+        else:
+            worker = DriveWorker(
+                source_path=info.path, output_path=cfg['output_path'], info=info,
+                registry=self._registry, coordinator=self._coordinator,
+                use_gdrive=cfg['use_gdrive'], use_rclone=cfg['use_rclone'],
+                use_b2=cfg['use_b2'], rclone_path=self._rclone_path or '',
+                rclone_remote=cfg['rclone_remote'], gd_subfolder=cfg['gd_subfolder'],
+                b2_key_id=cfg['b2_key_id'], b2_app_key=cfg['b2_app_key'],
+                b2_bucket=cfg['b2_bucket'], log_fn=self._log,
+                on_done=lambda s, r=row: self.after(0, lambda: self._drive_done(r, s)),
+                on_progress=lambda s, r=row: self._on_progress_throttled(r, s),
+                ntfy_topic=cfg['ntfy_topic'], resume=resume,
+                running_ref=lambda: self._running,
+            )
         with self._drive_lock:
             for i, (r2, info2, _) in enumerate(self._drives):
                 if info2.path == info.path:
