@@ -65,6 +65,23 @@ Run the app on a Mac and a Windows machine at the same time, pointed at the same
 
 It goes through the exact same dedup registry as physical drives: Google's own stored checksum is checked against already-migrated hashes before anything downloads, so known duplicates cost zero bandwidth. Google Docs, Sheets, Slides, and Drawings — which have no fixed binary form to hash — are exported to PDF/XLSX/PPTX/SVG first, then hashed and deduped the same way as everything else (so a Doc that happens to export to bytes identical to something already migrated is still caught). Files with no export target (Forms, Sites, Apps Script, etc.) are skipped and reported in the summary, same as any other unsupported file type.
 
+## Import from Backblaze B2
+
+**☁ Import from Backblaze B2 (to NAS)** (next to Import from Google Drive) pulls files from a B2 bucket straight down onto a local folder — the reverse direction of a normal migration, for pulling everything back down onto a fresh NAS. Only usable when the destination is set to Local Folder.
+
+Pick which file types to bring down when adding the import: checkboxes are grouped into five categories — Photos, Documents, Videos, Audio, Archives — each expandable to uncheck individual extensions. Files land sorted into folders named after those same categories, rather than the Documents/Photos split used elsewhere:
+
+```
+NAS folder/
+├── Photos/
+├── Documents/
+├── Videos/
+├── Audio/
+└── Archives/
+```
+
+Only folders a selection can actually produce files for are created — picking just Documents won't leave four empty folders behind. Duplicate detection still runs against the shared hash registry, but B2's own object checksum is SHA1, not MD5, so (unlike the Google Drive import's zero-download fast path) each file has to be downloaded and hashed locally before a duplicate can be caught — re-running the same import is still cheap, since already-downloaded files are skipped via resume without re-touching the network.
+
 ---
 
 ## Handy to know
