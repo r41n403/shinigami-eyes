@@ -60,6 +60,7 @@ STATE_DIR      = Path.home() / '.shinigami_eyes'
 HASH_DB_FILE   = STATE_DIR / 'hashes.db'
 B2_CONFIG_FILE  = STATE_DIR / 'b2_config.json'
 APP_CONFIG_FILE = STATE_DIR / 'config.json'
+INSTANCE_LOCK_FILE = STATE_DIR / 'instance.lock'
 
 
 def resource_path(filename: str) -> str:
@@ -625,30 +626,46 @@ def progress_file_for(output_path: str, source_path: str) -> Path:
     return STATE_DIR / f'progress_{key}.db'
 
 
+def _new_md5():
+    try:
+        return hashlib.md5(usedforsecurity=False)   # required on some macOS/Python builds
+    except TypeError:
+        return hashlib.md5()                        # older Python without the flag
+
+
 def copy_and_hash(src: str, dest_dir: str) -> tuple[str, str, int]:
     """Single-pass: copy + MD5 simultaneously. Returns (hash, tmp_path, bytes).
     Raises ValueError if bytes written don't match bytes read (write integrity check)."""
-    try:
-        h = hashlib.md5(usedforsecurity=False)   # required on some macOS/Python builds
-    except TypeError:
-        h = hashlib.md5()                        # older Python without the flag
     tmp = os.path.join(dest_dir, f'.se_{os.getpid()}_{os.urandom(4).hex()}')
-    written = 0
-    try:
-        with open(src, 'rb') as fsrc, open(tmp, 'wb') as fdst:
-            for chunk in iter(lambda: fsrc.read(CHUNK), b''):
-                h.update(chunk)
-                fdst.write(chunk)
-                written += len(chunk)
-        # Integrity check: staged file must be exactly the right size
-        staged = os.path.getsize(tmp)
-        if staged != written:
-            raise ValueError(f'write integrity fail: read {written}B, staged {staged}B')
-        return h.hexdigest(), tmp, written
-    except Exception:
-        try: os.unlink(tmp)
-        except Exception: pass
-        raise
+    # Self-healing: if dest_dir vanished out from under us (e.g. a second
+    # app instance's orphan cleanup swept it — see acquire_single_instance_
+    # lock()), recreate it and retry once instead of failing every single
+    # file for the rest of the batch.
+    for attempt in (1, 2):
+        h = _new_md5()
+        written = 0
+        try:
+            with open(src, 'rb') as fsrc, open(tmp, 'wb') as fdst:
+                for chunk in iter(lambda: fsrc.read(CHUNK), b''):
+                    h.update(chunk)
+                    fdst.write(chunk)
+                    written += len(chunk)
+            # Integrity check: staged file must be exactly the right size
+            staged = os.path.getsize(tmp)
+            if staged != written:
+                raise ValueError(f'write integrity fail: read {written}B, staged {staged}B')
+            return h.hexdigest(), tmp, written
+        except FileNotFoundError:
+            if attempt == 1 and not os.path.isdir(dest_dir):
+                os.makedirs(dest_dir, exist_ok=True)
+                continue
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
+        except Exception:
+            try: os.unlink(tmp)
+            except Exception: pass
+            raise
 
 
 def build_dest_path(dest_dir: str, filename: str) -> str:
@@ -1046,9 +1063,82 @@ def download_and_open_update(update: dict, on_status=None) -> bool:
         return False
 
 
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        if IS_WINDOWS:
+            # os.kill(pid, 0) isn't a reliable liveness check on Windows;
+            # tasklist is the standard way to ask "does this PID exist".
+            r = subprocess.run(['tasklist', '/FI', f'PID eq {pid}'],
+                               capture_output=True, text=True, timeout=5)
+            return str(pid) in r.stdout
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def acquire_single_instance_lock() -> bool:
+    """True if this process now holds the lock; False if another live
+    instance already holds it. Two instances sharing one state dir and one
+    TMPDIR is unsafe in more than one way, but the concrete bug this fixes:
+    a second instance's startup orphan-cleanup ran unconditionally and
+    deleted the FIRST instance's in-progress staging folder mid-batch,
+    producing a 'No such file or directory' error for every file staged
+    afterward. A stale lock (dead PID, or unreadable/corrupt file) is
+    treated as free and simply overwritten."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        old_pid = int(INSTANCE_LOCK_FILE.read_text().strip())
+        if _pid_is_alive(old_pid):
+            return False
+    except Exception:
+        pass
+    try:
+        INSTANCE_LOCK_FILE.write_text(str(os.getpid()))
+    except Exception:
+        pass
+    return True
+
+
+ORPHAN_STAGE_MIN_AGE_SECS = 15 * 60   # 15 minutes
+
+
+def _latest_mtime(path: str) -> float:
+    """Most recent mtime anywhere in path's tree. A stage dir's own mtime
+    only changes when ITS immediate entries change — i.e. once, when
+    Documents/ and Photos/ are first created — not when files are staged
+    into those subfolders. Checking only the top-level dir would make an
+    actively-filling stage dir look 'old' immediately after creation."""
+    latest = os.path.getmtime(path)
+    try:
+        for root, dirs, files in os.walk(path):
+            for name in dirs + files:
+                try:
+                    latest = max(latest, os.path.getmtime(os.path.join(root, name)))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return latest
+
+
 def cleanup_orphan_stages():
+    """Remove leftover se_stage_* staging dirs from a crashed/force-quit
+    previous run. Age-gated: anything touched more recently than the
+    threshold is presumed still in active use and left alone. This is
+    defense-in-depth — the primary protection is the single-instance lock in
+    main(), added after a second app instance's *unconditional* cleanup here
+    deleted a first instance's in-progress staging folder mid-batch,
+    producing a 'No such file or directory' error for every remaining file."""
+    now = time.time()
     for d in glob.glob(os.path.join(tempfile.gettempdir(), 'se_stage_*')):
         try:
+            if now - _latest_mtime(d) < ORPHAN_STAGE_MIN_AGE_SECS:
+                continue
             shutil.rmtree(d)
         except Exception:
             pass
@@ -2663,6 +2753,21 @@ def main():
         app.destroy()
         print(f'Shinigami Eyes v{VERSION} uicheck OK')
         return
+
+    if not acquire_single_instance_lock():
+        # Running two instances against the same state dir / staging
+        # directory is unsafe — see acquire_single_instance_lock() for the
+        # exact failure this prevents. Show a plain dialog and exit rather
+        # than open a second full UI.
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            'Shinigami Eyes is already running',
+            'Only one instance of Shinigami Eyes can run at a time.\n\n'
+            'A second instance would interfere with any migration already '
+            'in progress. Switch to the existing window instead.')
+        root.destroy()
+        sys.exit(1)
 
     app = MigrationApp()
     app.mainloop()
