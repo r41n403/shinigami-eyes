@@ -1112,8 +1112,7 @@ def push_local_hashes(rclone_path: str, b2_key_id: str, b2_app_key: str,
         if r.returncode != 0:
             log(f'  WARN  could not push hash DB to B2: {r.stderr.strip()[:300]}', 'warn')
         else:
-            kb = HASH_DB_FILE.stat().st_size / 1024
-            log(f'  ↑ Hash DB pushed to B2 ({kb:.0f} KB)', 'info')
+            log(f'  ↑ Hash DB pushed to B2 ({_fmt_bytes(HASH_DB_FILE.stat().st_size)})', 'info')
     except Exception as e:
         log(f'  WARN  could not push hash DB to B2: {e}', 'warn')
 
