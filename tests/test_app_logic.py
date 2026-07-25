@@ -28,7 +28,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODULE_NAME = 'nas_migrate_gui_under_test'
@@ -266,6 +266,58 @@ class TestCopyAndHashSelfHeal(unittest.TestCase):
         h, tmp, written = app_mod.copy_and_hash(src, dest_dir)
         self._tmp_files.append(tmp)
         self.assertEqual(written, size)
+
+
+class TestPlayDriveDoneSound(unittest.TestCase):
+    """play_drive_done_sound() must never raise or block — it's called
+    straight from the UI thread's _drive_done() callback, so a missing
+    sound file, a headless box with no audio device, or a launch failure
+    must be swallowed exactly like send_ntfy() swallows network errors."""
+
+    def setUp(self):
+        self._orig_mac = app_mod.IS_MAC
+        self._orig_win = app_mod.IS_WINDOWS
+        self._orig_linux = app_mod.IS_LINUX
+        self._orig_sound = app_mod.DRIVE_DONE_SOUND
+
+    def tearDown(self):
+        app_mod.IS_MAC = self._orig_mac
+        app_mod.IS_WINDOWS = self._orig_win
+        app_mod.IS_LINUX = self._orig_linux
+        app_mod.DRIVE_DONE_SOUND = self._orig_sound
+
+    def test_noop_when_sound_file_missing(self):
+        app_mod.DRIVE_DONE_SOUND = '/no/such/file.wav'
+        with patch('subprocess.Popen') as mock_popen:
+            app_mod.play_drive_done_sound()
+            mock_popen.assert_not_called()
+
+    def test_mac_uses_afplay(self):
+        app_mod.IS_MAC, app_mod.IS_WINDOWS, app_mod.IS_LINUX = True, False, False
+        with tempfile.NamedTemporaryFile(suffix='.wav') as f:
+            app_mod.DRIVE_DONE_SOUND = f.name
+            with patch('subprocess.Popen') as mock_popen:
+                app_mod.play_drive_done_sound()
+                mock_popen.assert_called_once()
+                args = mock_popen.call_args[0][0]
+                self.assertEqual(args[0], 'afplay')
+                self.assertEqual(args[1], f.name)
+
+    def test_linux_uses_aplay(self):
+        app_mod.IS_MAC, app_mod.IS_WINDOWS, app_mod.IS_LINUX = False, False, True
+        with tempfile.NamedTemporaryFile(suffix='.wav') as f:
+            app_mod.DRIVE_DONE_SOUND = f.name
+            with patch('subprocess.Popen') as mock_popen:
+                app_mod.play_drive_done_sound()
+                mock_popen.assert_called_once()
+                self.assertIn('aplay', mock_popen.call_args[0][0])
+
+    def test_playback_failure_is_swallowed(self):
+        app_mod.IS_MAC, app_mod.IS_WINDOWS, app_mod.IS_LINUX = True, False, False
+        with tempfile.NamedTemporaryFile(suffix='.wav') as f:
+            app_mod.DRIVE_DONE_SOUND = f.name
+            with patch('subprocess.Popen', side_effect=OSError('no such program')):
+                app_mod.play_drive_done_sound()   # must not raise
 
 
 if __name__ == '__main__':

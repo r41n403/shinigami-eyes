@@ -72,6 +72,8 @@ class TestTriggers(unittest.TestCase):
                        'app source not in trigger paths — pushes to it would not rebuild')
         self.assertIn('shinigami_eyes_logo.png', paths,
                        'logo asset not in trigger paths — a logo-only change would not rebuild')
+        self.assertIn('jenny_drive_completed.wav', paths,
+                       'drive-done sound not in trigger paths — a sound-only change would not rebuild')
         self.assertIn('.github/workflows/build-executables.yml', paths)
 
     def test_release_trigger_present(self):
@@ -184,6 +186,14 @@ class TestBuildSteps(unittest.TestCase):
         # and make sure neither accidentally used the other platform's separator
         self.assertNotIn('shinigami_eyes_logo.png:.', win['run'])
         self.assertNotIn('shinigami_eyes_logo.png;.', mac['run'])
+
+    def test_drive_done_sound_bundled_with_platform_correct_separator(self):
+        win = self._step('Build (Windows)')
+        mac = self._step('Build (macOS)')
+        self.assertIn('--add-data "jenny_drive_completed.wav;."', win['run'])
+        self.assertIn('--add-data "jenny_drive_completed.wav:."', mac['run'])
+        self.assertNotIn('jenny_drive_completed.wav:.', win['run'])
+        self.assertNotIn('jenny_drive_completed.wav;.', mac['run'])
 
     def test_version_stamped_from_release_tag(self):
         # Regression: v3.4.0 shipped with VERSION = '3.0.0' because nobody
