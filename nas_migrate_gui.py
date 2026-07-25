@@ -637,6 +637,26 @@ def progress_file_for(output_path: str, source_path: str) -> Path:
     return STATE_DIR / f'progress_{key}.db'
 
 
+def resume_identity(info: DriveInfo) -> str:
+    """Stable identity string for resume-progress tracking — prefer the
+    drive's hardware serial number over its mount path.
+
+    Two different physical drives can share the same volume label and
+    therefore mount at the identical path (e.g. both named 'BACKUP' mount
+    at /Volumes/BACKUP on Mac, one after the other). Keying resume on path
+    alone would make the app think a second, unrelated drive was actually
+    the first one resuming, and silently skip any of its files whose path
+    happens to coincide with something the first drive already migrated —
+    a real (if narrow) risk of leaving files behind without any error.
+
+    get_drive_info() populates info.serial from the underlying physical
+    disk (diskutil on Mac, PowerShell Get-Disk on Windows) when available.
+    Falls back to info.path when there's no serial to key off of — some
+    external enclosures don't expose one reliably, and the Google Drive/B2
+    import sources aren't physical drives at all, so they have none."""
+    return info.serial or info.path
+
+
 def _new_md5():
     try:
         return hashlib.md5(usedforsecurity=False)   # required on some macOS/Python builds
@@ -1646,7 +1666,7 @@ class DriveWorker:
     def _migrate(self):
         use_cloud     = self.use_rclone or self.use_b2
         label         = self.info.label_or_name
-        progress_path = progress_file_for(self.out, self.src)
+        progress_path = progress_file_for(self.out, resume_identity(self.info))
         s             = self.stats
 
         # Prefix for staged filenames — volume name with spaces stripped
@@ -2024,8 +2044,9 @@ class GDriveImportWorker:
     ):
         self.remote       = remote
         self.folder       = folder
-        # Encoded so progress_file_for() derives the same resume key here as
-        # the pre-flight resume check in _start() (which hashes info.path).
+        # Encoded to equal info.path exactly — resume_identity() falls back
+        # to info.path for non-physical sources (no serial number), so this
+        # must match what the pre-flight resume check in _start() computes.
         self.src          = f'gdrive-import://{remote}:{folder}'
         self.out          = output_path
         self.info         = info
@@ -2082,7 +2103,7 @@ class GDriveImportWorker:
 
     def _migrate(self):
         label         = self.info.label_or_name
-        progress_path = progress_file_for(self.out, self.src)
+        progress_path = progress_file_for(self.out, resume_identity(self.info))
         s             = self.stats
 
         vol_prefix = sanitize_for_windows(re.sub(r'\s+', '', label)) + '_'
@@ -2323,8 +2344,9 @@ class B2ImportWorker:
     ):
         self.bucket      = bucket
         self.prefix      = prefix
-        # Encoded so progress_file_for() derives the same resume key here as
-        # the pre-flight resume check in _start() (which hashes info.path).
+        # Encoded to equal info.path exactly — resume_identity() falls back
+        # to info.path for non-physical sources (no serial number), so this
+        # must match what the pre-flight resume check in _start() computes.
         self.src         = f'b2-import://{bucket}:{prefix}'
         self.out         = output_path
         self.info        = info
@@ -2369,7 +2391,7 @@ class B2ImportWorker:
 
     def _migrate(self):
         label         = self.info.label_or_name
-        progress_path = progress_file_for(self.out, self.src)
+        progress_path = progress_file_for(self.out, resume_identity(self.info))
         s             = self.stats
 
         vol_prefix = sanitize_for_windows(re.sub(r'\s+', '', label)) + '_'
@@ -3649,7 +3671,7 @@ class MigrationApp(tk.Tk):
 
         resume_map: dict[str, bool] = {}
         for _, info, _ in entries:
-            prog = progress_file_for(output_path, info.path)
+            prog = progress_file_for(output_path, resume_identity(info))
             resume_map[info.path] = False
             if prog.exists():
                 try:
