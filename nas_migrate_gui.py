@@ -3190,6 +3190,23 @@ class MigrationApp(tk.Tk):
         scrollbar.pack(side='right', fill='y')
         self._drive_canvas = canvas
 
+        # This canvas sits nested inside ctrl_canvas, which unbinds the
+        # global wheel handler on <Leave> — and the pointer crossing onto
+        # this nested canvas (or any of the drive row widgets inside it)
+        # fires exactly that Leave, since screen-region ownership passes to
+        # the topmost child. Without its own Enter/Leave-scoped handler,
+        # scrolling here silently stopped working and only the slider did
+        # anything. On Leave, hand wheel scrolling back to ctrl_canvas's
+        # handler rather than unbinding outright, since the pointer is
+        # still within the controls pane, just no longer over this list.
+        def _on_drive_wheel(e):
+            delta = -e.delta if IS_MAC else -e.delta // 120
+            canvas.yview_scroll(int(delta), 'units')
+        canvas.bind('<Enter>',
+                   lambda e: canvas.bind_all('<MouseWheel>', _on_drive_wheel))
+        canvas.bind('<Leave>',
+                   lambda e: canvas.bind_all('<MouseWheel>', _on_wheel))
+
         # Global totals bar (updated by workers)
         self._totals_lbl = tk.Label(outer, text='',
                                     font=(MONO_FONT, 10, 'bold'), fg=TEAL, bg=BG,
