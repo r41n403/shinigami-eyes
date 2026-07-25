@@ -74,6 +74,7 @@ def resource_path(filename: str) -> str:
 
 
 LOGO_FILE = resource_path('shinigami_eyes_logo.png')
+DRIVE_DONE_SOUND = resource_path('jenny_drive_completed.wav')
 
 # ── Colours (Matrix theme) ────────────────────────────────────────────────────
 BG      = '#000000'
@@ -611,6 +612,33 @@ def _free_bytes() -> int:
 def _can_stage(size: int) -> bool:
     free = _free_bytes()
     return free > max(MIN_FREE_BYTES, size + 512 * 1024 * 1024)
+
+
+def play_drive_done_sound():
+    """Play DRIVE_DONE_SOUND when a drive/import finishes successfully.
+    Best-effort and always non-blocking — a missing sound file, a headless
+    box with no audio device, or any other playback failure must never
+    interrupt or slow down a migration run.
+
+    No extra dependencies: winsound is stdlib on Windows, afplay ships with
+    every Mac. Both are launched async (winsound's SND_ASYNC flag / a bare
+    subprocess.Popen rather than .run()) so the UI thread never blocks
+    waiting for playback to finish."""
+    if not os.path.exists(DRIVE_DONE_SOUND):
+        return
+    try:
+        if IS_WINDOWS:
+            import winsound
+            winsound.PlaySound(DRIVE_DONE_SOUND,
+                              winsound.SND_FILENAME | winsound.SND_ASYNC)
+        elif IS_MAC:
+            subprocess.Popen(['afplay', DRIVE_DONE_SOUND],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif IS_LINUX:
+            subprocess.Popen(['aplay', '-q', DRIVE_DONE_SOUND],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def send_ntfy(topic: str, message: str, title: str = 'Shinigami Eyes'):
@@ -3903,6 +3931,8 @@ class MigrationApp(tk.Tk):
     def _drive_done(self, row: DriveRow, stats: DriveStats):
         row.update_stats(stats)
         self._update_totals()
+        if stats.status == 'done':
+            play_drive_done_sound()
 
     def _all_done(self):
         was_aborted = not self._running   # _stop() sets this False before we get here

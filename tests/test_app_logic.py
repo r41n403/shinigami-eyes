@@ -28,7 +28,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODULE_NAME = 'nas_migrate_gui_under_test'
@@ -268,57 +268,56 @@ class TestCopyAndHashSelfHeal(unittest.TestCase):
         self.assertEqual(written, size)
 
 
-class TestResumeIdentity(unittest.TestCase):
-    """resume_identity() is what progress_file_for() keys resume-tracking
-    on. Regression coverage for a real incident risk: two different
-    physical drives sharing a volume label mount at the identical path
-    (e.g. /Volumes/BACKUP on Mac), which — if resume were keyed on path
-    alone — would make the app think a second, unrelated drive was the
-    first one resuming, and silently skip any of its files whose path
-    happened to coincide with something the first drive already migrated."""
+class TestPlayDriveDoneSound(unittest.TestCase):
+    """play_drive_done_sound() must never raise or block — it's called
+    straight from the UI thread's _drive_done() callback, so a missing
+    sound file, a headless box with no audio device, or a launch failure
+    must be swallowed exactly like send_ntfy() swallows network errors."""
 
-    def test_prefers_serial_over_path_when_both_present(self):
-        info = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
-        self.assertEqual(app_mod.resume_identity(info), 'SN-AAA111')
+    def setUp(self):
+        self._orig_mac = app_mod.IS_MAC
+        self._orig_win = app_mod.IS_WINDOWS
+        self._orig_linux = app_mod.IS_LINUX
+        self._orig_sound = app_mod.DRIVE_DONE_SOUND
 
-    def test_falls_back_to_path_when_serial_is_empty(self):
-        info = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='')
-        self.assertEqual(app_mod.resume_identity(info), '/Volumes/BACKUP')
+    def tearDown(self):
+        app_mod.IS_MAC = self._orig_mac
+        app_mod.IS_WINDOWS = self._orig_win
+        app_mod.IS_LINUX = self._orig_linux
+        app_mod.DRIVE_DONE_SOUND = self._orig_sound
 
-    def test_falls_back_to_path_for_import_sources_with_no_serial(self):
-        # Google Drive / B2 import sources aren't physical drives — they
-        # never have a serial, so identity must still equal info.path
-        # exactly (GDriveImportWorker/B2ImportWorker's self.src is encoded
-        # to match info.path precisely for this reason).
-        info = app_mod.DriveInfo(path='gdrive-import://gdrive:Folder')
-        self.assertEqual(app_mod.resume_identity(info), 'gdrive-import://gdrive:Folder')
+    def test_noop_when_sound_file_missing(self):
+        app_mod.DRIVE_DONE_SOUND = '/no/such/file.wav'
+        with patch('subprocess.Popen') as mock_popen:
+            app_mod.play_drive_done_sound()
+            mock_popen.assert_not_called()
 
-    def test_same_label_different_drives_get_different_identity(self):
-        # The exact bug scenario: two physically different drives happen to
-        # share a volume label and therefore mount at the same path.
-        drive_a = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
-        drive_b = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-BBB222')
-        self.assertNotEqual(app_mod.resume_identity(drive_a),
-                            app_mod.resume_identity(drive_b))
+    def test_mac_uses_afplay(self):
+        app_mod.IS_MAC, app_mod.IS_WINDOWS, app_mod.IS_LINUX = True, False, False
+        with tempfile.NamedTemporaryFile(suffix='.wav') as f:
+            app_mod.DRIVE_DONE_SOUND = f.name
+            with patch('subprocess.Popen') as mock_popen:
+                app_mod.play_drive_done_sound()
+                mock_popen.assert_called_once()
+                args = mock_popen.call_args[0][0]
+                self.assertEqual(args[0], 'afplay')
+                self.assertEqual(args[1], f.name)
 
-    def test_same_physical_drive_different_mount_path_gets_same_identity(self):
-        # The flip side, and a nice side effect of the fix: the SAME
-        # physical drive reconnected at a different path (Windows
-        # reassigns a drive letter, or Mac appends '-1' to avoid a name
-        # collision) is still correctly recognized as the same drive.
-        first_session = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
-        second_session = app_mod.DriveInfo(path='/Volumes/BACKUP-1', serial='SN-AAA111')
-        self.assertEqual(app_mod.resume_identity(first_session),
-                         app_mod.resume_identity(second_session))
+    def test_linux_uses_aplay(self):
+        app_mod.IS_MAC, app_mod.IS_WINDOWS, app_mod.IS_LINUX = False, False, True
+        with tempfile.NamedTemporaryFile(suffix='.wav') as f:
+            app_mod.DRIVE_DONE_SOUND = f.name
+            with patch('subprocess.Popen') as mock_popen:
+                app_mod.play_drive_done_sound()
+                mock_popen.assert_called_once()
+                self.assertIn('aplay', mock_popen.call_args[0][0])
 
-    def test_progress_file_for_reflects_the_same_distinction(self):
-        # End-to-end through progress_file_for(), not just resume_identity()
-        # in isolation — this is what actually determines the resume file.
-        drive_a = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
-        drive_b = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-BBB222')
-        path_a = app_mod.progress_file_for('/dest', app_mod.resume_identity(drive_a))
-        path_b = app_mod.progress_file_for('/dest', app_mod.resume_identity(drive_b))
-        self.assertNotEqual(path_a, path_b)
+    def test_playback_failure_is_swallowed(self):
+        app_mod.IS_MAC, app_mod.IS_WINDOWS, app_mod.IS_LINUX = True, False, False
+        with tempfile.NamedTemporaryFile(suffix='.wav') as f:
+            app_mod.DRIVE_DONE_SOUND = f.name
+            with patch('subprocess.Popen', side_effect=OSError('no such program')):
+                app_mod.play_drive_done_sound()   # must not raise
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ on:
       - 'shinigami_eyes_logo.png'
       - 'shinigami_eyes.ico'
       - 'shinigami_eyes.icns'
+      - 'jenny_drive_completed.wav'
       - '.github/workflows/build-executables.yml'
   # NOT `push: tags:` — a `paths` filter applies to every push event
   # including tag pushes, and tag pushes don't match it, so tag-triggered
@@ -102,13 +103,14 @@ jobs:
         if: matrix.platform == 'macos'
         run: python3.12 -m pip install --break-system-packages pyinstaller
 
-      # --add-data bundles the logo PNG next to the frozen executable so
-      # resource_path() (which checks sys._MEIPASS at runtime) can find it.
-      # The SRC/DEST separator is platform-specific: ';' on Windows, ':'
-      # everywhere else, because ':' collides with Windows drive letters.
+      # --add-data bundles the logo PNG and drive-done sound next to the
+      # frozen executable so resource_path() (which checks sys._MEIPASS at
+      # runtime) can find them. The SRC/DEST separator is platform-specific:
+      # ';' on Windows, ':' everywhere else, because ':' collides with
+      # Windows drive letters.
       - name: Build (Windows)
         if: matrix.platform == 'windows'
-        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --icon shinigami_eyes.ico --add-data "shinigami_eyes_logo.png;." nas_migrate_gui.py
+        run: pyinstaller --onefile --windowed --name "Shinigami Eyes" --icon shinigami_eyes.ico --add-data "shinigami_eyes_logo.png;." --add-data "jenny_drive_completed.wav;." nas_migrate_gui.py
 
       # Code-signs dist\Shinigami Eyes.exe via Azure Artifact Signing (formerly
       # Trusted Signing). Requires a one-time Azure setup (signing account +
@@ -149,7 +151,7 @@ jobs:
       - name: Build (macOS)
         if: matrix.platform == 'macos'
         run: |
-          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --icon shinigami_eyes.icns --add-data "shinigami_eyes_logo.png:." --add-binary "rclone:." nas_migrate_gui.py
+          python3.12 -m PyInstaller --windowed --name "Shinigami Eyes" --icon shinigami_eyes.icns --add-data "shinigami_eyes_logo.png:." --add-data "jenny_drive_completed.wav:." --add-binary "rclone:." nas_migrate_gui.py
           # Smoke tests on the frozen binary. A --windowed PyInstaller app
           # fails silently on double-click, so catch launch crashes here
           # instead of after release:
