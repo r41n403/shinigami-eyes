@@ -268,5 +268,58 @@ class TestCopyAndHashSelfHeal(unittest.TestCase):
         self.assertEqual(written, size)
 
 
+class TestResumeIdentity(unittest.TestCase):
+    """resume_identity() is what progress_file_for() keys resume-tracking
+    on. Regression coverage for a real incident risk: two different
+    physical drives sharing a volume label mount at the identical path
+    (e.g. /Volumes/BACKUP on Mac), which — if resume were keyed on path
+    alone — would make the app think a second, unrelated drive was the
+    first one resuming, and silently skip any of its files whose path
+    happened to coincide with something the first drive already migrated."""
+
+    def test_prefers_serial_over_path_when_both_present(self):
+        info = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
+        self.assertEqual(app_mod.resume_identity(info), 'SN-AAA111')
+
+    def test_falls_back_to_path_when_serial_is_empty(self):
+        info = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='')
+        self.assertEqual(app_mod.resume_identity(info), '/Volumes/BACKUP')
+
+    def test_falls_back_to_path_for_import_sources_with_no_serial(self):
+        # Google Drive / B2 import sources aren't physical drives — they
+        # never have a serial, so identity must still equal info.path
+        # exactly (GDriveImportWorker/B2ImportWorker's self.src is encoded
+        # to match info.path precisely for this reason).
+        info = app_mod.DriveInfo(path='gdrive-import://gdrive:Folder')
+        self.assertEqual(app_mod.resume_identity(info), 'gdrive-import://gdrive:Folder')
+
+    def test_same_label_different_drives_get_different_identity(self):
+        # The exact bug scenario: two physically different drives happen to
+        # share a volume label and therefore mount at the same path.
+        drive_a = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
+        drive_b = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-BBB222')
+        self.assertNotEqual(app_mod.resume_identity(drive_a),
+                            app_mod.resume_identity(drive_b))
+
+    def test_same_physical_drive_different_mount_path_gets_same_identity(self):
+        # The flip side, and a nice side effect of the fix: the SAME
+        # physical drive reconnected at a different path (Windows
+        # reassigns a drive letter, or Mac appends '-1' to avoid a name
+        # collision) is still correctly recognized as the same drive.
+        first_session = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
+        second_session = app_mod.DriveInfo(path='/Volumes/BACKUP-1', serial='SN-AAA111')
+        self.assertEqual(app_mod.resume_identity(first_session),
+                         app_mod.resume_identity(second_session))
+
+    def test_progress_file_for_reflects_the_same_distinction(self):
+        # End-to-end through progress_file_for(), not just resume_identity()
+        # in isolation — this is what actually determines the resume file.
+        drive_a = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-AAA111')
+        drive_b = app_mod.DriveInfo(path='/Volumes/BACKUP', serial='SN-BBB222')
+        path_a = app_mod.progress_file_for('/dest', app_mod.resume_identity(drive_a))
+        path_b = app_mod.progress_file_for('/dest', app_mod.resume_identity(drive_b))
+        self.assertNotEqual(path_a, path_b)
+
+
 if __name__ == '__main__':
     unittest.main()
