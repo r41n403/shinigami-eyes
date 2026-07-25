@@ -430,6 +430,17 @@ class DriveInfo:
     manufacturer: str = ''
     bus:          str = ''
 
+    # Only set for B2-import sources (path starts with 'b2-import://') — B2
+    # credentials and the file-type filter are per-import-item, not shared
+    # run-level config like the destination panel's B2 fields, since two B2
+    # imports added in the same run could point at different buckets or
+    # want different file types. See B2ImportDialog / B2ImportWorker.
+    b2_import_key_id:     str = ''
+    b2_import_app_key:    str = ''
+    b2_import_bucket:     str = ''
+    b2_import_prefix:     str = ''
+    b2_import_extensions: str = ''   # comma-joined, e.g. '.jpg,.png,.pdf'
+
     @property
     def label_or_name(self) -> str:
         return self.label or os.path.basename(self.path) or self.path
@@ -954,6 +965,151 @@ def download_gdrive_file(rclone_path: str, remote: str, folder: str, entry: dict
             written += len(chunk)
 
     return h.hexdigest(), downloaded_path, written, downloaded_name, work_dir
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKBLAZE B2 IMPORT  — B2 bucket → local NAS folder, organized into
+# category folders with a user-selectable file-type filter. This is a
+# separate, more granular taxonomy from DOC_EXTENSIONS/IMAGE_EXTENSIONS
+# (which drive the existing Documents/Photos split for outbound migrations)
+# — used only by B2ImportDialog / B2ImportWorker.
+# ══════════════════════════════════════════════════════════════════════════════
+
+B2_IMPORT_CATEGORIES: dict[str, set[str]] = {
+    'Photos': IMAGE_EXTENSIONS,
+    'Documents': {
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        '.pages', '.numbers', '.key', '.txt', '.rtf', '.odt', '.ods',
+        '.csv', '.json', '.xml', '.html', '.htm', '.md',
+        '.psd', '.ai', '.eps', '.indd', '.sketch', '.fig', '.xd',
+        '.prproj', '.aep', '.fcpx', '.ppj', '.drp',
+        '.emlx', '.emlxpart', '.eml', '.msg',
+        '.olk14message', '.olk14msgsource', '.olk14contact',
+        '.olk14folder', '.olk14category', '.olk14task',
+    },
+    'Videos': {
+        '.mp4', '.mov', '.avi', '.mkv', '.m4v', '.wmv', '.flv', '.webm',
+        '.mpg', '.mpeg', '.mpe', '.m2v', '.vob', '.ogv', '.divx',
+        '.rm', '.rmvb', '.asf', '.f4v',
+    },
+    'Audio': {
+        '.mp3', '.aac', '.flac', '.wav', '.aiff', '.aif', '.m4a',
+        '.ogg', '.oga', '.wma', '.opus', '.alac', '.ape',
+        '.mid', '.midi', '.amr',
+    },
+    'Archives': {
+        '.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz',
+        '.dmg', '.iso', '.tgz', '.tbz2',
+    },
+}
+
+
+def categorize_for_b2_import(filename: str) -> str:
+    """Return the B2_IMPORT_CATEGORIES key matching filename's extension, or
+    '' if the extension isn't in any known category (caller skips those as
+    'unrecognized extension', same semantics as the rest of the app)."""
+    ext = os.path.splitext(filename)[1].lower()
+    for category, exts in B2_IMPORT_CATEGORIES.items():
+        if ext in exts:
+            return category
+    return ''
+
+
+def list_b2_entries(rclone_path: str, b2_key_id: str, b2_app_key: str,
+                    bucket: str, prefix: str, log_fn=None) -> Optional[list[dict]]:
+    """Enumerate every file under a B2 bucket/prefix via `rclone lsjson`.
+
+    Deliberately does NOT request --hash: B2's native object hash is SHA1
+    (exposed by rclone's b2 backend), not MD5, so it can't be pre-compared
+    against this app's MD5-based HashRegistry the way Google Drive's own
+    MD5 lets list_gdrive_entries() skip known dupes before downloading.
+    Every non-resumed file here costs one real download; download_b2_file()
+    hashes it locally and the dedup check happens after that.
+
+    Uses rclone's connection-string syntax (:b2:bucket/prefix) with
+    --b2-account/--b2-key flags rather than a named remote — the same
+    pattern already used by pull_remote_hashes()/push_local_hashes() for
+    the hash-DB sync feature, so no rclone config file entry is required.
+
+    Returns None on failure (bad credentials, bucket not found, network
+    error, etc.) — caller must treat that as fatal, not an empty bucket."""
+    log = log_fn or (lambda msg, tag='': None)
+    remote_path = f':b2:{bucket}/{prefix}'.rstrip('/') if prefix else f':b2:{bucket}'
+    b2_flags = [f'--b2-account={b2_key_id}', f'--b2-key={b2_app_key}']
+    try:
+        r = subprocess.run(
+            [rclone_path, 'lsjson', '--recursive', '--files-only', remote_path] + b2_flags,
+            capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            log(f'  ERR  rclone lsjson failed: {r.stderr.strip()[:300]}', 'err')
+            return None
+        raw = json.loads(r.stdout)
+    except subprocess.TimeoutExpired:
+        log('  ERR  rclone lsjson timed out — very large bucket?', 'err')
+        return None
+    except Exception as e:
+        log(f'  ERR  could not list B2 bucket: {e}', 'err')
+        return None
+
+    entries = []
+    for item in raw:
+        entries.append({
+            'path': item.get('Path', item.get('Name', '')),
+            'name': item.get('Name', ''),
+            'size': int(item.get('Size', 0) or 0),
+        })
+    return entries
+
+
+def download_b2_file(rclone_path: str, b2_key_id: str, b2_app_key: str,
+                     bucket: str, prefix: str, entry: dict,
+                     work_root: str) -> tuple[str, str, int, str]:
+    """Download one file from a B2 bucket/prefix into its own private temp
+    dir, then hash it locally with MD5 (see list_b2_entries for why this
+    can't be pre-checked against the registry before downloading).
+
+    entry['path'] comes from list_b2_entries()'s `rclone lsjson
+    --recursive`, which reports paths relative to the queried root
+    (bucket/prefix) — not relative to the bucket's own root. prefix must be
+    re-prefixed here or rclone looks for the file at the bucket root and
+    fails to find it. (This is the exact same class of bug that hit the
+    Google Drive import feature — see download_gdrive_file.)
+
+    Uses `rclone copyto` rather than `copy`: the destination filename is
+    already known exactly (entry['name']), so there's no need to guess at
+    what rclone produced the way download_gdrive_file() has to for Google's
+    export-format uncertainty.
+
+    Returns (md5_hex, local_tmp_path, bytes_written, filename). Caller must
+    remove the returned work directory's parent (local_tmp_path's dirname)
+    or just the file itself when done. Raises RuntimeError on failure."""
+    work_dir = tempfile.mkdtemp(dir=work_root, prefix='.se_b2dl_')
+    base = f':b2:{bucket}/{prefix}'.rstrip('/') if prefix else f':b2:{bucket}'
+    src_remote_path = f'{base}/{entry["path"]}'
+    dest_path = os.path.join(work_dir, entry['name'])
+    b2_flags = [f'--b2-account={b2_key_id}', f'--b2-key={b2_app_key}']
+    cmd = [rclone_path, 'copyto', src_remote_path, dest_path] + b2_flags
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise RuntimeError('download timed out after 10 minutes')
+
+    if r.returncode != 0 or not os.path.exists(dest_path):
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise RuntimeError((r.stderr or 'rclone copyto produced no file').strip()[:300])
+
+    try:
+        h = hashlib.md5(usedforsecurity=False)   # required on some macOS/Python builds
+    except TypeError:
+        h = hashlib.md5()                        # older Python without the flag
+    written = 0
+    with open(dest_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(CHUNK), b''):
+            h.update(chunk)
+            written += len(chunk)
+
+    return h.hexdigest(), dest_path, written, entry['name']
 
 
 def load_b2_config() -> dict:
@@ -2127,6 +2283,250 @@ class GDriveImportWorker:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# B2 IMPORT WORKER  — Backblaze B2 bucket → local NAS folder, organized by
+# category with a user-selected file-type filter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class B2ImportWorker:
+    """Downloads files from a Backblaze B2 bucket/prefix straight onto a
+    local folder (a NAS mount, typically), organized into category folders
+    (see B2_IMPORT_CATEGORIES — Photos/Documents/Videos/Audio/Archives,
+    a different, more granular split than the Documents/Photos used
+    elsewhere), filtered to only the extensions the user selected when
+    adding this import.
+
+    Unlike DriveWorker/GDriveImportWorker, there's no staging/
+    UploadCoordinator leg here — the destination IS local disk, so each
+    file is downloaded once, hashed, and either discarded (duplicate) or
+    moved straight into its final category folder. B2's own object hash is
+    SHA1 (see list_b2_entries), not MD5, so — unlike Google Drive import's
+    zero-download dedup fast path — every non-resumed, non-filtered-out
+    file costs one real download before it can be checked against the
+    MD5-based HashRegistry. Resume (progress_file_for) still makes repeat
+    runs against the same bucket/prefix -> NAS folder pair cheap.
+
+    Deliberately NOT a subclass of DriveWorker or GDriveImportWorker, for
+    the same reason those two aren't subclasses of each other — little
+    shared code, and duplicating the small walk/dedup pattern here is lower
+    risk than a shared base class touching all three. Only usable with a
+    Local Folder destination — enforced by the caller, not here."""
+
+    def __init__(
+        self, *,
+        bucket: str, prefix: str, output_path: str, info: DriveInfo,
+        registry: HashRegistry, rclone_path: str,
+        b2_key_id: str, b2_app_key: str,
+        extensions: frozenset,
+        log_fn=print, on_done=None, on_progress=None,
+        ntfy_topic='', resume=False,
+        running_ref: Callable = lambda: True,
+    ):
+        self.bucket      = bucket
+        self.prefix      = prefix
+        # Encoded so progress_file_for() derives the same resume key here as
+        # the pre-flight resume check in _start() (which hashes info.path).
+        self.src         = f'b2-import://{bucket}:{prefix}'
+        self.out         = output_path
+        self.info        = info
+        self.registry    = registry
+        self.rclone_path = rclone_path
+        self.b2_key_id   = b2_key_id
+        self.b2_app_key  = b2_app_key
+        self.extensions  = extensions
+        self._log        = log_fn
+        self._on_done        = on_done or (lambda s: None)
+        self._on_progress_cb = on_progress or (lambda s: None)
+        self.ntfy_topic  = ntfy_topic
+        self.resume      = resume
+        self._running    = running_ref
+        self.stats       = DriveStats(label=info.label_or_name)
+        self._active     = False
+        self._last_progress_t = 0.0
+
+    def is_alive(self): return self._active
+
+    def _on_progress(self, s: DriveStats):
+        now = time.monotonic()
+        if now - self._last_progress_t < 1.0:
+            return
+        self._last_progress_t = now
+        self._on_progress_cb(s)
+
+    def _run(self):
+        self._active      = True
+        self.stats.status = 'running'
+        try:
+            self._migrate()
+        except Exception as e:
+            self.stats.fatal  = str(e)
+            self.stats.status = 'error'
+            self._log(f'  [{self.info.label_or_name}] FATAL: {e}', 'err')
+        finally:
+            self._active = False
+            if not self.stats.fatal:
+                self.stats.status = 'done' if self._running() else 'aborted'
+            self._on_done(self.stats)
+
+    def _migrate(self):
+        label         = self.info.label_or_name
+        progress_path = progress_file_for(self.out, self.src)
+        s             = self.stats
+
+        vol_prefix = sanitize_for_windows(re.sub(r'\s+', '', label)) + '_'
+        used_names: dict[str, set[str]] = {c: set() for c in B2_IMPORT_CATEGORIES}
+
+        def unique_name(category: str, filename: str) -> str:
+            filename = sanitize_for_windows(filename)
+            used = used_names[category]
+            base, ext = os.path.splitext(filename)
+            candidate = filename
+            counter = 1
+            while candidate in used:
+                candidate = f'{base}_{counter}{ext}'
+                counter += 1
+            used.add(candidate)
+            return candidate
+
+        # ── Resume set ────────────────────────────────────────────────────────
+        processed: set[str] = set()
+        if self.resume and progress_path.exists():
+            try:
+                with open(progress_path) as f:
+                    for line in f:
+                        p = line.strip()
+                        if p: processed.add(p)
+                self._log(f'  [{label}] Resuming — {len(processed):,} already done')
+            except Exception:
+                pass
+
+        # Only pre-create folders for categories the filter can actually
+        # produce files for — no point leaving 4 empty folders on the NAS
+        # because the user only wanted Documents.
+        for category, exts in B2_IMPORT_CATEGORIES.items():
+            if exts & self.extensions:
+                os.makedirs(os.path.join(self.out, category), exist_ok=True)
+
+        # ── List source ──────────────────────────────────────────────────────
+        self._log(f'  [{label}] Listing B2 bucket "{self.bucket}/{self.prefix or ""}"…', 'head')
+        send_ntfy(self.ntfy_topic, f'Started: {label} (Backblaze B2 import)',
+                  title='Shinigami Eyes — Import Started')
+
+        entries = list_b2_entries(self.rclone_path, self.b2_key_id, self.b2_app_key,
+                                  self.bucket, self.prefix, log_fn=self._log)
+        if entries is None:
+            s.fatal = 'Could not list B2 bucket — check credentials, bucket name, and path'
+            self._log(f'  [{label}] ERR {s.fatal}', 'err')
+            return
+
+        files_seen = len(entries)
+        skip_reasons: dict[str, int] = {}
+        self._log(f'  [{label}] Found {files_seen:,} file(s)', 'info')
+
+        for entry in entries:
+            if not self._running(): break
+
+            resume_key = entry['path']
+            if resume_key in processed:
+                s.skipped_resume += 1
+                skip_reasons['already done (resume)'] = skip_reasons.get('already done (resume)', 0) + 1
+                self._on_progress(s)
+                continue
+
+            skip, reason = should_skip(entry['name'], entry['size'])
+            if skip:
+                s.skipped_sys += 1
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+                self._on_progress(s)
+                continue
+
+            category = categorize_for_b2_import(entry['name'])
+            if not category:
+                s.skipped_sys += 1
+                skip_reasons['unrecognized extension'] = skip_reasons.get(
+                    'unrecognized extension', 0) + 1
+                self._on_progress(s)
+                continue
+
+            ext = os.path.splitext(entry['name'])[1].lower()
+            if ext not in self.extensions:
+                s.skipped_sys += 1
+                skip_reasons['filtered out by file-type selection'] = skip_reasons.get(
+                    'filtered out by file-type selection', 0) + 1
+                self._on_progress(s)
+                continue
+
+            waited = False
+            while not _can_stage(entry['size']):
+                if not self._running(): return
+                if not waited:
+                    self._log(f'  [{label}] ⏳ Low disk — waiting for space…', 'warn')
+                    waited = True
+                time.sleep(15)
+
+            try:
+                h, local_path, written, dl_name = download_b2_file(
+                    self.rclone_path, self.b2_key_id, self.b2_app_key,
+                    self.bucket, self.prefix, entry, tempfile.gettempdir())
+            except Exception as e:
+                s.errors += 1
+                self._log(f'  [{label}] ERR {entry["name"]}: {e}', 'err')
+                if s.errors == 1:
+                    send_ntfy(self.ntfy_topic, f'Error on {entry["name"]}: {e}',
+                              title=f'Shinigami Eyes — Error on {label}')
+                continue
+
+            work_dir = os.path.dirname(local_path)
+
+            if self.registry.contains(h):
+                s.skipped_dupe += 1
+                skip_reasons['duplicate (hash match)'] = skip_reasons.get('duplicate (hash match)', 0) + 1
+                self._on_progress(s)
+                shutil.rmtree(work_dir, ignore_errors=True)
+                continue
+
+            dest_dir    = os.path.join(self.out, category)
+            final_fname = unique_name(category, vol_prefix + dl_name)
+            dest        = os.path.join(dest_dir, final_fname)
+            try:
+                shutil.move(local_path, dest)
+            except Exception as e:
+                s.errors += 1
+                self._log(f'  [{label}] ERR move {dl_name}: {e}', 'err')
+                shutil.rmtree(work_dir, ignore_errors=True)
+                continue
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+            s.copied      += 1
+            s.bytes_copied += written
+            self._on_progress(s)
+
+            # Local dest — confirm immediately, same as DriveWorker's local
+            # (non-cloud) branch. No staging/upload leg to defer through.
+            self.registry.add(h, dest)
+            try:
+                with open(progress_path, 'a') as pf:
+                    pf.write(resume_key + '\n')
+            except Exception:
+                pass
+
+        self.registry.flush()
+
+        if files_seen == 0:
+            self._log(f'  [{label}] ⚠️  No files found at that bucket/prefix', 'warn')
+        if skip_reasons:
+            reasons_str = '  ·  '.join(f'{v:,} {k}' for k, v in
+                                       sorted(skip_reasons.items(), key=lambda x: -x[1]))
+            self._log(f'  [{label}] ℹ️  {files_seen:,} seen · skipped: {reasons_str}', 'info')
+
+        summary = (f'{s.copied:,} copied · {s.skipped_dupe:,} dupes ·'
+                   f' {s.skipped_resume:,} resumed · {s.errors:,} errors ·'
+                   f' {_fmt_bytes(s.bytes_copied)}')
+        self._log(f'  [{label}] ✓ DONE — {summary}', 'ok')
+        send_ntfy(self.ntfy_topic, f'✅ {label} import complete.\n\n{summary}',
+                  title=f'Shinigami Eyes — Import {label} complete')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # VOLUME PICKER DIALOG
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2328,6 +2728,205 @@ class GDriveImportDialog(tk.Toplevel):
         self.destroy()
 
 
+class B2ImportDialog(tk.Toplevel):
+    """Prompts for B2 credentials/bucket/prefix and which file types to
+    pull down onto the NAS, then does a quick synchronous `rclone lsd`
+    sanity check before accepting — same pattern as GDriveImportDialog.
+
+    File types are grouped into the same five categories files get sorted
+    into on disk (B2_IMPORT_CATEGORIES): each category has a checkbox that
+    toggles every extension in it at once, plus a ▸/▾ button to expand the
+    category and uncheck individual extensions. All extensions start
+    selected."""
+
+    def __init__(self, parent, rclone_path: str, *,
+                default_key_id='', default_app_key='',
+                default_bucket='', default_prefix=''):
+        super().__init__(parent)
+        self.title('Import from Backblaze B2')
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.grab_set()
+        self.rclone_path = rclone_path
+        self.result: Optional[tuple[str, str, str, str, frozenset]] = None
+
+        tk.Label(self, text='Import from Backblaze B2',
+                 font=(MONO_FONT, 12, 'bold'), fg=GREEN, bg=BG
+                 ).pack(padx=20, pady=(16, 4))
+        tk.Label(self,
+                 text='Downloads files from a B2 bucket straight onto this\n'
+                      'NAS folder, sorted into Photos/Documents/Videos/\n'
+                      'Audio/Archives, deduplicated against files already\n'
+                      'here from a previous import.',
+                 font=(MONO_FONT, 9), fg=MUTED, bg=BG, justify='left'
+                 ).pack(padx=20, pady=(0, 12))
+
+        form = tk.Frame(self, bg=BG)
+        form.pack(padx=20, fill='x')
+
+        self.var_key_id = tk.StringVar(value=default_key_id)
+        self.var_app_key = tk.StringVar(value=default_app_key)
+        self.var_bucket = tk.StringVar(value=default_bucket)
+        self.var_prefix = tk.StringVar(value=default_prefix)
+
+        def _row(r, label, var, mask=False):
+            tk.Label(form, text=f'{label}:', font=(MONO_FONT, 10), fg=FG, bg=BG,
+                     width=10, anchor='e').grid(row=r, column=0, pady=4, sticky='e')
+            kw = {'show': '●'} if mask else {}
+            tk.Entry(form, textvariable=var, width=28,
+                     bg=SURFACE, fg=FG, insertbackground=GREEN,
+                     relief='flat', font=(MONO_FONT, 10), **kw
+                     ).grid(row=r, column=1, pady=4, padx=(8, 0), sticky='w')
+
+        _row(0, 'Key ID', self.var_key_id)
+        _row(1, 'App Key', self.var_app_key, mask=True)
+        _row(2, 'Bucket', self.var_bucket)
+        _row(3, 'Prefix', self.var_prefix)
+        tk.Label(self, text='(leave Prefix blank to import the whole bucket)',
+                 font=(MONO_FONT, 8), fg=MUTED, bg=BG
+                 ).pack(padx=20, pady=(0, 10))
+
+        # ── File-type filter ─────────────────────────────────────────────
+        self._lbl_row(self, 'File types to import:').pack(anchor='w', padx=20)
+
+        self.category_vars: dict[str, tk.BooleanVar] = {}
+        self.ext_vars: dict[str, dict[str, tk.BooleanVar]] = {}
+        self._ext_frames: dict[str, tk.Frame] = {}
+        self._expand_btns: dict[str, tk.Button] = {}
+
+        types_frame = tk.Frame(self, bg=BG)
+        types_frame.pack(padx=20, fill='x', pady=(4, 4))
+
+        for category, exts in B2_IMPORT_CATEGORIES.items():
+            self.ext_vars[category] = {ext: tk.BooleanVar(value=True)
+                                       for ext in sorted(exts)}
+            self.category_vars[category] = tk.BooleanVar(value=True)
+
+            row = tk.Frame(types_frame, bg=BG)
+            row.pack(fill='x', anchor='w')
+            tk.Checkbutton(
+                row, text=f'{category} ({len(exts)} types)',
+                variable=self.category_vars[category],
+                command=lambda c=category: self._toggle_category(c),
+                font=(MONO_FONT, 10), fg=FG, bg=BG, selectcolor=SURFACE,
+                activebackground=BG, activeforeground=GREEN, anchor='w'
+                ).pack(side='left')
+            expand_btn = tk.Button(
+                row, text='▸', font=(MONO_FONT, 9), bg=BG, fg=MUTED,
+                relief='flat', bd=0, padx=6,
+                command=lambda c=category: self._toggle_expand(c))
+            expand_btn.pack(side='left')
+            self._expand_btns[category] = expand_btn
+
+            ext_frame = tk.Frame(types_frame, bg=BG)
+            self._ext_frames[category] = ext_frame
+            # 6 extensions per line keeps this from becoming one giant column
+            for i, ext in enumerate(sorted(exts)):
+                col = i % 6
+                if col == 0:
+                    line = tk.Frame(ext_frame, bg=BG)
+                    line.pack(fill='x', anchor='w', padx=(24, 0))
+                tk.Checkbutton(
+                    line, text=ext, variable=self.ext_vars[category][ext],
+                    command=lambda c=category: self._sync_category_checkbox(c),
+                    font=(MONO_FONT, 8), fg=MUTED, bg=BG, selectcolor=SURFACE,
+                    activebackground=BG, activeforeground=GREEN
+                    ).pack(side='left')
+            # Collapsed by default — not packed until _toggle_expand shows it.
+
+        self._status_lbl = tk.Label(self, text='', font=(MONO_FONT, 9), bg=BG)
+        self._status_lbl.pack(padx=20, pady=(4, 4))
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=(8, 16))
+        self._add_btn = tk.Button(btn_row, text='Check & Add',
+                  font=(MONO_FONT, 11, 'bold'),
+                  bg=GREEN, fg='#000', activebackground='#d8a533',
+                  relief='flat', padx=14, pady=6, command=self._check_and_add)
+        self._add_btn.pack(side='left', padx=8)
+        tk.Button(btn_row, text='Cancel',
+                  font=(MONO_FONT, 11), bg=SURFACE, fg=GREEN,
+                  relief='flat', padx=14, pady=6,
+                  command=self.destroy).pack(side='left', padx=8)
+
+    def _lbl_row(self, parent, text):
+        return tk.Label(parent, text=text, font=(MONO_FONT, 9, 'bold'), fg=GREEN, bg=BG)
+
+    def _toggle_expand(self, category: str):
+        frame = self._ext_frames[category]
+        btn = self._expand_btns[category]
+        if frame.winfo_ismapped():
+            frame.pack_forget()
+            btn.config(text='▸')
+        else:
+            frame.pack(fill='x', anchor='w', pady=(0, 4))
+            btn.config(text='▾')
+
+    def _toggle_category(self, category: str):
+        """Category checkbox is a bulk select-all/select-none convenience —
+        it doesn't track partial-selection state, it just sets every
+        extension in the category to match whatever it was just clicked to."""
+        new_val = self.category_vars[category].get()
+        for var in self.ext_vars[category].values():
+            var.set(new_val)
+
+    def _sync_category_checkbox(self, category: str):
+        """After an individual extension checkbox changes, reflect whether
+        ALL/NONE/SOME of the category is selected on the category checkbox
+        (tk.Checkbutton has no tristate, so 'some' just shows unchecked)."""
+        all_on = all(v.get() for v in self.ext_vars[category].values())
+        self.category_vars[category].set(all_on)
+
+    def _selected_extensions(self) -> frozenset:
+        return frozenset(
+            ext for cat in self.ext_vars.values()
+            for ext, var in cat.items() if var.get())
+
+    def _check_and_add(self):
+        key_id = self.var_key_id.get().strip()
+        app_key = self.var_app_key.get().strip()
+        bucket = self.var_bucket.get().strip()
+        prefix = self.var_prefix.get().strip().strip('/')
+
+        if not key_id or not app_key or not bucket:
+            self._status_lbl.config(text='Fill in Key ID, App Key, and Bucket', fg=RED)
+            return
+        if not self.rclone_path:
+            self._status_lbl.config(text='rclone not found', fg=RED)
+            return
+        extensions = self._selected_extensions()
+        if not extensions:
+            self._status_lbl.config(text='Select at least one file type', fg=RED)
+            return
+
+        self._add_btn.config(state='disabled')
+        self._status_lbl.config(text='Checking…', fg=MUTED)
+        self.update_idletasks()
+
+        remote_path = f':b2:{bucket}/{prefix}'.rstrip('/') if prefix else f':b2:{bucket}'
+        b2_flags = [f'--b2-account={key_id}', f'--b2-key={app_key}']
+        try:
+            r = subprocess.run([self.rclone_path, 'lsd', remote_path] + b2_flags,
+                               capture_output=True, text=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            self._status_lbl.config(text='Timed out — check credentials/bucket/prefix', fg=RED)
+            self._add_btn.config(state='normal')
+            return
+        except Exception as e:
+            self._status_lbl.config(text=f'Error: {e}', fg=RED)
+            self._add_btn.config(state='normal')
+            return
+
+        if r.returncode != 0:
+            self._status_lbl.config(
+                text=(r.stderr.strip()[:80] or 'Could not reach that bucket/prefix'), fg=RED)
+            self._add_btn.config(state='normal')
+            return
+
+        self.result = (key_id, app_key, bucket, prefix, extensions)
+        self.destroy()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DRIVE ROW WIDGET
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2406,7 +3005,7 @@ class DriveRow(tk.Frame):
         self._icon_lbl.config(text=icon, fg=color)
 
         if stats.status == 'done':
-            is_import = self.info.path.startswith('gdrive-import://')
+            is_import = self.info.path.startswith(('gdrive-import://', 'b2-import://'))
             tail = 'IMPORT COMPLETE' if is_import else 'SAFE TO DISCONNECT'
             msg = (f'✓ DONE — {stats.copied:,} copied · '
                    f'{stats.skipped_dupe:,} dupes · '
@@ -2606,7 +3205,7 @@ class MigrationApp(tk.Tk):
 
         # Add drive button
         add_row = tk.Frame(outer, bg=BG)
-        add_row.pack(fill='x', pady=(8, 14))
+        add_row.pack(fill='x', pady=(8, 6))
         tk.Button(add_row, text='＋  Add Drives',
                   font=(MONO_FONT, 11, 'bold'),
                   bg=SURFACE, fg=GREEN,
@@ -2621,11 +3220,20 @@ class MigrationApp(tk.Tk):
                   relief='flat', padx=14, pady=6, cursor='hand2',
                   command=self._import_gdrive).pack(side='left', padx=(8, 0))
 
+        import_row2 = tk.Frame(outer, bg=BG)
+        import_row2.pack(fill='x', pady=(0, 14))
+        tk.Button(import_row2, text='☁  Import from Backblaze B2 (to NAS)',
+                  font=(MONO_FONT, 11, 'bold'),
+                  bg=SURFACE, fg=GREEN,
+                  activebackground='#938f87', activeforeground=GREEN,
+                  relief='flat', padx=14, pady=6, cursor='hand2',
+                  command=self._import_b2).pack(side='left')
+
         # Max parallel
-        tk.Label(add_row, text='Max parallel:',
+        tk.Label(import_row2, text='Max parallel:',
                  font=(MONO_FONT, 10), fg=GREEN, bg=BG).pack(side='left', padx=(20, 4))
         self.var_workers = tk.IntVar(value=DEFAULT_WORKERS)
-        ttk.Spinbox(add_row, from_=1, to=8, width=4,
+        ttk.Spinbox(import_row2, from_=1, to=8, width=4,
                     textvariable=self.var_workers,
                     font=(MONO_FONT, 10)).pack(side='left')
 
@@ -2881,6 +3489,37 @@ class MigrationApp(tk.Tk):
         info = DriveInfo(path=path, label=label, fs_type='Google Drive (import)')
         self._add_drive_row(info)
 
+    def _import_b2(self):
+        if not self._rclone_path:
+            messagebox.showwarning('rclone required',
+                f'Importing from Backblaze B2 needs rclone.\n\n{RCLONE_INSTALL_HINT}')
+            return
+        already = {info.path for _, info, _ in self._drives}
+        # Pre-fill from the destination panel's B2 fields — the common case
+        # is pulling back down whatever this app has already migrated up to
+        # the same bucket, but every field stays editable in the dialog.
+        dlg = B2ImportDialog(
+            self, self._rclone_path,
+            default_key_id=self.var_b2_key_id.get(),
+            default_app_key=self.var_b2_app_key.get(),
+            default_bucket=self.var_b2_bucket.get(),
+            default_prefix=self.var_b2_subfolder.get())
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        key_id, app_key, bucket, prefix, extensions = dlg.result
+        path = f'b2-import://{bucket}:{prefix}'
+        if path in already:
+            messagebox.showinfo('Already added', 'That B2 bucket/prefix is already in the list.')
+            return
+        label = f'B2: {prefix or bucket}'
+        info = DriveInfo(
+            path=path, label=label, fs_type='Backblaze B2 (import)',
+            b2_import_key_id=key_id, b2_import_app_key=app_key,
+            b2_import_bucket=bucket, b2_import_prefix=prefix,
+            b2_import_extensions=','.join(sorted(extensions)))
+        self._add_drive_row(info)
+
     def _add_drive_row(self, info: DriveInfo):
         row = DriveRow(
             self._drive_frame, info,
@@ -2920,12 +3559,31 @@ class MigrationApp(tk.Tk):
 
         has_gdrive_import = any(info.path.startswith('gdrive-import://')
                                for _, info, _ in self._drives)
+        has_b2_import = any(info.path.startswith('b2-import://')
+                           for _, info, _ in self._drives)
+
+        if has_gdrive_import and has_b2_import:
+            messagebox.showwarning(
+                'Conflicting sources',
+                "Google Drive imports need a Backblaze B2 destination, but "
+                "Backblaze B2 imports need a Local Folder destination — "
+                "they can't run in the same batch.\n\n"
+                'Remove one of them from the source list.')
+            return
         if has_gdrive_import and not use_b2:
             messagebox.showwarning(
                 'Backblaze B2 required',
                 'Google Drive imports upload directly to Backblaze B2 only.\n\n'
                 'Switch Destination to Backblaze B2, or remove the Google '
                 'Drive import from the source list.')
+            return
+        if has_b2_import and mode != 'local':
+            messagebox.showwarning(
+                'Local Folder required',
+                'Backblaze B2 imports download directly to a local folder '
+                '(your NAS) only.\n\n'
+                'Switch Destination to Local Folder, or remove the '
+                'Backblaze B2 import from the source list.')
             return
         use_rclone = False
         rclone_remote = ''
@@ -3102,10 +3760,10 @@ class MigrationApp(tk.Tk):
         self.after(0, self._all_done)
 
     def _launch_worker(self, row: 'DriveRow', info: DriveInfo, resume: bool):
-        """Spawn a worker for one drive OR one Google Drive import — dispatch
-        is by info.path prefix so the rest of the app (drive list, resume
-        dialogs, hot-add, progress display) never needs to know the
-        difference. Safe to call mid-run."""
+        """Spawn a worker for one drive, one Google Drive import, or one B2
+        import — dispatch is by info.path prefix so the rest of the app
+        (drive list, resume dialogs, hot-add, progress display) never needs
+        to know the difference. Safe to call mid-run."""
         cfg = self._run_cfg
         if info.path.startswith('gdrive-import://'):
             remote, folder = info.path[len('gdrive-import://'):].split(':', 1)
@@ -3115,6 +3773,23 @@ class MigrationApp(tk.Tk):
                 rclone_path=self._rclone_path or '', gd_subfolder=cfg['gd_subfolder'],
                 b2_key_id=cfg['b2_key_id'], b2_app_key=cfg['b2_app_key'],
                 b2_bucket=cfg['b2_bucket'], log_fn=self._log,
+                on_done=lambda s, r=row: self.after(0, lambda: self._drive_done(r, s)),
+                on_progress=lambda s, r=row: self._on_progress_throttled(r, s),
+                ntfy_topic=cfg['ntfy_topic'], resume=resume,
+                running_ref=lambda: self._running,
+            )
+        elif info.path.startswith('b2-import://'):
+            # Credentials/bucket/prefix/extensions are per-item (stored on
+            # info), not run-level cfg — two B2 imports in the same run can
+            # point at different buckets or want different file types.
+            extensions = frozenset(
+                e for e in info.b2_import_extensions.split(',') if e)
+            worker = B2ImportWorker(
+                bucket=info.b2_import_bucket, prefix=info.b2_import_prefix,
+                output_path=cfg['output_path'], info=info,
+                registry=self._registry, rclone_path=self._rclone_path or '',
+                b2_key_id=info.b2_import_key_id, b2_app_key=info.b2_import_app_key,
+                extensions=extensions, log_fn=self._log,
                 on_done=lambda s, r=row: self.after(0, lambda: self._drive_done(r, s)),
                 on_progress=lambda s, r=row: self._on_progress_throttled(r, s),
                 ntfy_topic=cfg['ntfy_topic'], resume=resume,
